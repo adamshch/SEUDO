@@ -37,7 +37,9 @@ Repository = "https://github.com/adamshch/SEUDO"
 
 [project.optional-dependencies]
 gui = ["PyQt5", "matplotlib"]
-dev = ["pytest", "PyQt5", "matplotlib"]
+matlab = ["h5py"]
+all = ["PyQt5", "matplotlib", "h5py"]
+dev = ["pytest", "PyQt5", "matplotlib", "h5py"]
 
 [build-system]
 requires = ["setuptools>=61", "pybind11>=2.10"]

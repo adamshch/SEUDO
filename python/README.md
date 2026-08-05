@@ -28,6 +28,8 @@ viewer).
 ```bash
 pip install seudo            # core library only
 pip install seudo[gui]       # + the PyQt5 classification GUI
+pip install seudo[matlab]    # + h5py, for loading real MATLAB v7.3 .mat files
+pip install seudo[all]       # gui + matlab
 ```
 
 For local development, from this directory:
