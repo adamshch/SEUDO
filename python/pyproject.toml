@@ -1,0 +1,47 @@
+[project]
+name = "seudo"
+version = "0.0.1"
+description = "Python port of the SEUDO calcium-imaging source-extraction toolbox (in progress)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [
+    { name = "Adam Charles" },
+    { name = "Jeff Gauthier" },
+]
+keywords = [
+    "calcium imaging",
+    "neuroscience",
+    "source extraction",
+    "fluorescence",
+    "microscopy",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+]
+
+[project.urls]
+Homepage = "https://github.com/adamshch/SEUDO"
+Repository = "https://github.com/adamshch/SEUDO"
+
+[project.optional-dependencies]
+gui = ["PyQt5", "matplotlib"]
+dev = ["pytest", "PyQt5", "matplotlib"]
+
+[build-system]
+requires = ["setuptools>=61", "pybind11>=2.10"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["seudo*"]

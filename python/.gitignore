@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# built native accelerator (optional; build with seudo/_native/build_native.sh)
+seudo/_native/*.so
+seudo/_native/*.o

@@ -1,0 +1,7 @@
+# Ensure the native accelerator's C++ sources (headers especially -- setuptools
+# only auto-includes files listed directly in Extension `sources`, i.e. the
+# .cpp files, not the .hpp headers they #include) ship in the sdist, so
+# `pip install seudo` from a source distribution can actually compile it.
+recursive-include seudo/_native *.cpp *.hpp *.h
+include seudo/_native/vendor/LICENSE
+include seudo/_native/build_native.sh
