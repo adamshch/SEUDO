@@ -1,5 +1,7 @@
 # seudo
 
+[![PyPI version](https://img.shields.io/pypi/v/seudo.svg)](https://pypi.org/project/seudo/)
+
 Python port (in progress) of [SEUDO](https://github.com/adamshch/SEUDO), a
 toolbox for removing false transients from calcium imaging source
 extraction. Original MATLAB implementation and paper: Gauthier & Charles,
@@ -29,9 +31,22 @@ viewer).
 pip install seudo
 ```
 
-This includes the PyQt5 classification GUI and h5py (for loading real
-MATLAB v7.3 `.mat` files) as standard dependencies, since the GUI is a
-core part of the workflow, not an add-on.
+Published on [PyPI](https://pypi.org/project/seudo/); requires Python
+>= 3.9. This includes the PyQt5 classification GUI and h5py (for loading
+real MATLAB v7.3 `.mat` files) as standard dependencies, since the GUI is
+a core part of the workflow, not an add-on.
+
+If a C++ compiler is available at install time, `pip install seudo` also
+builds an optional native accelerator for the core solver (multi-threaded,
+several times faster on real datasets). This is entirely automatic and
+never blocks the install -- without a compiler, `seudo` falls back to a
+pure-Python solver with identical results, just slower. Check whether the
+accelerator is active with:
+
+```python
+from seudo._native import NATIVE_AVAILABLE
+print(NATIVE_AVAILABLE)
+```
 
 For local development, from this directory:
 
