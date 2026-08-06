@@ -111,6 +111,33 @@ class _SeudoRunWorker(QtCore.QThread):
             self.failed.emit(str(exc))
 
 
+class _AutoClassifyWorker(QtCore.QThread):
+    """Runs auto_classify_transients on a background thread -- the
+    seudo_residual criterion calls the real sparse solver once per
+    transient and can take a while on a large dataset."""
+
+    progress = QtCore.pyqtSignal(int, int, int)  # done, total, cell_id
+    finished_ok = QtCore.pyqtSignal(list)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, se, which_struct, auto_classify_kwargs, parent=None):
+        super().__init__(parent)
+        self.se = se
+        self.which_struct = which_struct
+        self.auto_classify_kwargs = auto_classify_kwargs
+
+    def run(self):
+        try:
+            result = auto_classify_transients(
+                self.se, self.which_struct, overwrite=True, save_results=True,
+                progress_callback=lambda done, total, cc: self.progress.emit(done, total, cc),
+                **self.auto_classify_kwargs,
+            )
+            self.finished_ok.emit(result)
+        except Exception as exc:  # noqa: BLE001 -- surface any failure to the GUI, don't crash the thread silently
+            self.failed.emit(str(exc))
+
+
 class ClassifyTransientsWindow(QtWidgets.QMainWindow):
     def __init__(self, se, which_struct='default', n_trans_x=5, parent=None):
         super().__init__(parent)
@@ -186,9 +213,9 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
         left_widget.setMaximumWidth(330)
 
         # the left column (counts, profile, FOV picture, scatter plot,
-        # sort/title/blur controls, save/load, SEUDO run panel) spans the
-        # full window height and can be taller than the window -- scroll it,
-        # rather than letting it get silently squashed
+        # sort/title/blur controls, save/load) spans the full window
+        # height and can be taller than the window -- scroll it, rather
+        # than letting it get silently squashed
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidget(left_widget)
         left_scroll.setWidgetResizable(True)
@@ -196,7 +223,24 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
         left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         main_row.addWidget(left_scroll, 0)
 
-        main_row.addLayout(self._build_right_panel(), 1)
+        main_row.addLayout(self._build_center_panel(), 1)
+
+        # right column: auto-classify + Run SEUDO -- kept in their own
+        # scrolling sidebar (same treatment as the left one) so the time
+        # course + thumbnail grid in the middle get as much width as
+        # possible and the left sidebar isn't stretched tall by these two
+        # (fairly infrequently used) panels
+        right_widget = QtWidgets.QWidget()
+        right_widget.setLayout(self._build_right_sidebar_panel())
+        right_widget.setMaximumWidth(280)
+
+        right_scroll = QtWidgets.QScrollArea()
+        right_scroll.setWidget(right_widget)
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setMaximumWidth(300)
+        right_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        main_row.addWidget(right_scroll, 0)
+
         outer.addLayout(main_row, 1)
 
         outer.addLayout(self._build_cell_nav_bar())
@@ -290,9 +334,13 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
         load_btn.clicked.connect(self._on_load)
         col.addWidget(load_btn)
 
+        col.addStretch(1)
+        return col
+
+    def _build_right_sidebar_panel(self):
+        col = QtWidgets.QVBoxLayout()
         col.addWidget(self._build_auto_classify_panel())
         col.addWidget(self._build_run_seudo_panel())
-
         col.addStretch(1)
         return col
 
@@ -327,6 +375,14 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
         self.auto_classify_btn = QtWidgets.QPushButton('Auto-classify (all cells)')
         self.auto_classify_btn.clicked.connect(self._on_auto_classify_clicked)
         form.addRow(self.auto_classify_btn)
+
+        self.auto_classify_progress = QtWidgets.QProgressBar()
+        self.auto_classify_progress.setRange(0, 1)
+        form.addRow(self.auto_classify_progress)
+
+        self.auto_classify_status_label = QtWidgets.QLabel('')
+        self.auto_classify_status_label.setWordWrap(True)
+        form.addRow(self.auto_classify_status_label)
 
         return group
 
@@ -366,15 +422,34 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
                 blob_radius=self.seudo_blob_radius_spin.value(),
             )
 
-        # the seudo_residual criterion runs the real sparse solver once per
-        # transient and can take a while on a large dataset -- give at
-        # least a busy-cursor cue rather than freezing silently
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        try:
-            auto_classify_transients(self.se, self.which_struct, overwrite=True, save_results=True, **kwargs)
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
+        if getattr(self, '_auto_classify_worker', None) is not None and self._auto_classify_worker.isRunning():
+            return
+
+        self.auto_classify_btn.setEnabled(False)
+        self.auto_classify_progress.setRange(0, self.se.n_cells)
+        self.auto_classify_progress.setValue(0)
+        self.auto_classify_status_label.setText(f'Auto-classifying {self.se.n_cells} cell(s)...')
+
+        worker = _AutoClassifyWorker(self.se, self.which_struct, kwargs, self)
+        worker.progress.connect(self._on_auto_classify_progress)
+        worker.finished_ok.connect(self._on_auto_classify_finished)
+        worker.failed.connect(self._on_auto_classify_failed)
+        self._auto_classify_worker = worker
+        worker.start()
+
+    def _on_auto_classify_progress(self, done, total, cell_id):
+        self.auto_classify_progress.setValue(done)
+        self.auto_classify_status_label.setText(
+            f'Auto-classify: {done}/{total} cell(s) done (last: cell {cell_id + 1})')
+
+    def _on_auto_classify_finished(self, results):
+        self.auto_classify_btn.setEnabled(True)
+        self.auto_classify_status_label.setText(f'Auto-classify done ({len(results)} cell(s)).')
         self.refresh()
+
+    def _on_auto_classify_failed(self, message):
+        self.auto_classify_btn.setEnabled(True)
+        self.auto_classify_status_label.setText(f'Auto-classify failed: {message}')
 
     def _build_run_seudo_panel(self):
         # port of the core idea in @seudo/parallelSEUDO.m: run SEUDO restricted
@@ -430,13 +505,17 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
         self.run_seudo_all_btn.clicked.connect(self._run_seudo_all_cells)
         form.addRow(self.run_seudo_all_btn)
 
+        self.seudo_progress = QtWidgets.QProgressBar()
+        self.seudo_progress.setRange(0, 1)
+        form.addRow(self.seudo_progress)
+
         self.seudo_status_label = QtWidgets.QLabel('')
         self.seudo_status_label.setWordWrap(True)
         form.addRow(self.seudo_status_label)
 
         return group
 
-    def _build_right_panel(self):
+    def _build_center_panel(self):
         col = QtWidgets.QVBoxLayout()
 
         col.addLayout(self._build_time_course_section())
@@ -652,6 +731,8 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
         params = self._collect_seudo_params()
         self.run_seudo_one_btn.setEnabled(False)
         self.run_seudo_all_btn.setEnabled(False)
+        self.seudo_progress.setRange(0, len(which_cells))
+        self.seudo_progress.setValue(0)
         self.seudo_status_label.setText(f'Running SEUDO on {len(which_cells)} cell(s)...')
 
         worker = _SeudoRunWorker(self.se, self.which_struct, which_cells, params, self)
@@ -668,6 +749,7 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
         self._run_seudo(list(range(self.se.n_cells)))
 
     def _on_seudo_progress(self, done, total, cell_idx):
+        self.seudo_progress.setValue(done)
         self.seudo_status_label.setText(f'SEUDO: {done}/{total} cell(s) done (last: cell {cell_idx + 1})')
 
     def _on_seudo_finished(self, result):

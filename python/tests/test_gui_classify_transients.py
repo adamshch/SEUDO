@@ -204,6 +204,7 @@ def test_auto_classify_button_writes_classification_for_every_cell(qapp, se, mon
         win.auto_classify_thresh_spin.setValue(-1.0)  # lenient -- everything should end up true
 
         win._on_auto_classify_clicked()
+        _wait_for_auto_classify_worker(qapp, win)
 
         for cell_idx in range(se.n_cells):
             ti = se.tc_default['transient_info'][cell_idx]
@@ -224,6 +225,7 @@ def test_auto_classify_res_ratio_criterion_uses_res_ratio_thresh(qapp, se, monke
         win.auto_classify_thresh_spin.setValue(1e6)  # lenient in the res-ratio direction
 
         win._on_auto_classify_clicked()
+        _wait_for_auto_classify_worker(qapp, win)
 
         for cell_idx in range(se.n_cells):
             ti = se.tc_default['transient_info'][cell_idx]
@@ -242,7 +244,9 @@ def test_auto_classify_seudo_residual_criterion_uses_run_seudo_panel_params(qapp
         monkeypatch.setattr(QtWidgets.QMessageBox, 'question',
                              staticmethod(lambda *a, **k: QtWidgets.QMessageBox.Yes))
         win.auto_classify_criterion_combo.setCurrentText('SEUDO residual')
-        win.auto_classify_thresh_spin.setValue(1e6)  # lenient -- everything should end up true
+        # high fraction is the "true" direction for this criterion, so a
+        # very low threshold is lenient (everything ends up true)
+        win.auto_classify_thresh_spin.setValue(-1e6)
 
         captured = {}
         orig = mod.auto_classify_transients
@@ -253,9 +257,10 @@ def test_auto_classify_seudo_residual_criterion_uses_run_seudo_panel_params(qapp
 
         monkeypatch.setattr(mod, 'auto_classify_transients', _spy)
         win._on_auto_classify_clicked()
+        _wait_for_auto_classify_worker(qapp, win)
 
         assert captured['criterion'] == 'seudo_residual'
-        assert captured['seudo_residual_thresh'] == 1e6
+        assert captured['seudo_residual_thresh'] == -1e6
         assert captured['seudo_kwargs'] == dict(
             sigma2=win.seudo_sigma2_spin.value(),
             lambda_blob=win.seudo_lambda_blob_spin.value(),
@@ -567,6 +572,12 @@ def test_switching_cell_resets_scroll_position(qapp, se_many_transients):
 
 def _wait_for_seudo_worker(qapp, win, timeout_ms=30000):
     assert win._seudo_worker.wait(timeout_ms), 'SEUDO worker did not finish in time'
+    for _ in range(20):
+        qapp.processEvents()
+
+
+def _wait_for_auto_classify_worker(qapp, win, timeout_ms=30000):
+    assert win._auto_classify_worker.wait(timeout_ms), 'auto-classify worker did not finish in time'
     for _ in range(20):
         qapp.processEvents()
 

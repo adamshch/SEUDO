@@ -19,6 +19,12 @@ coef_lsq (fraction near 1).
 Reuses estimate.py's per-cell window setup and single-fit solve directly
 (_setup_cell_window, _solve_one_frame_cell) so this always agrees with what
 "Run SEUDO" itself would compute, rather than re-deriving the same math.
+
+Note: auto_classify.py's 'seudo_residual' criterion classifies *high*
+fraction as true (per explicit user direction) -- the opposite of the
+"low fraction = real" reading above, and the opposite convention from the
+'res_ratio' criterion. This module only computes the fraction; the
+classification direction lives in auto_classify.py.
 """
 
 import numpy as np

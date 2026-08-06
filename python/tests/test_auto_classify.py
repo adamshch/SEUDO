@@ -89,6 +89,14 @@ def test_cell_with_no_transients_returns_empty_metric(se):
     assert se.tc_default['transient_info'][2]['classification'].size == 0
 
 
+def test_progress_callback_invoked_per_cell(se):
+    calls = []
+    auto_classify_transients(
+        se, 'default', which_cells=[0, 1, 2],
+        progress_callback=lambda done, total, cell_id: calls.append((done, total, cell_id)))
+    assert calls == [(1, 3, 0), (2, 3, 1), (3, 3, 2)]
+
+
 def test_which_cells_restricts_processing(se):
     results = auto_classify_transients(se, 'default', which_cells=[1])
     assert len(results) == 1
@@ -152,12 +160,15 @@ def test_seudo_residual_distinguishes_real_from_contaminated_transient(se):
 
 
 def test_seudo_residual_thresh_changes_classification(se):
+    # high fraction is the "true" direction for this criterion (per
+    # explicit user direction, opposite of res_ratio) -- so a very low
+    # threshold is lenient (catches everything) and a very high one is strict.
     results_lenient = auto_classify_transients(
         se, 'default', which_cells=[0], save_results=False,
-        criterion='seudo_residual', seudo_residual_thresh=1e6)
+        criterion='seudo_residual', seudo_residual_thresh=-1e6)
     assert np.all(results_lenient[0]['classification'] == VAL_TRUE)
 
     results_strict = auto_classify_transients(
         se, 'default', which_cells=[0], save_results=False,
-        criterion='seudo_residual', seudo_residual_thresh=-1.0)
+        criterion='seudo_residual', seudo_residual_thresh=1e6)
     assert np.all(results_strict[0]['classification'] == VAL_FALSE)

@@ -53,7 +53,11 @@ def auto_classify_transients(
     res_ratio_thresh=0.5,
     seudo_residual_thresh=0.5,
     seudo_kwargs=None,
+    progress_callback=None,
 ):
+    """progress_callback, if given, is called as progress_callback(done,
+    total, cell_id) after each cell finishes -- lets a caller (e.g. a GUI)
+    report progress without depending on stdout."""
     if criterion not in ('corr', 'res_ratio', 'seudo_residual'):
         raise ValueError(
             f"criterion must be 'corr', 'res_ratio', or 'seudo_residual', got {criterion!r}")
@@ -91,8 +95,9 @@ def auto_classify_transients(
     )
 
     results = []
+    n_total = len(which_cells)
 
-    for cell_id in which_cells:
+    for done, cell_id in enumerate(which_cells, start=1):
         ti = transient_info[cell_id]
         n_trans = ti['times'].shape[0]
 
@@ -103,6 +108,8 @@ def auto_classify_transients(
             if save_results:
                 ti['classification'] = np.array([])
                 ti['auto_class'] = metric
+            if progress_callback is not None:
+                progress_callback(done, n_total, cell_id)
             continue
 
         tc = tc_struct['tc'][:, cell_id]
@@ -183,11 +190,11 @@ def auto_classify_transients(
         else:
             # fraction of this cell's own least-squares coefficient that
             # SEUDO's sparse fit diverts into the unmodeled "blob" basis
-            # instead -- near 0 for a real transient, near 1 for
-            # contamination SEUDO doesn't attribute to this cell.
+            # instead. *high* is the "true" direction here (per explicit
+            # user direction) -- unlike resRatio, which uses *low* for true.
             seudo_fractions = compute_seudo_residual_fractions(se, cell_id, ti, **(seudo_kwargs or {}))
             metric['seudoResidual'] = seudo_fractions
-            new_classification[seudo_fractions <= seudo_residual_thresh] = VAL_TRUE
+            new_classification[seudo_fractions >= seudo_residual_thresh] = VAL_TRUE
         is_false = new_classification == VAL_FALSE
         is_true = ~is_false
 
@@ -242,5 +249,8 @@ def auto_classify_transients(
         if save_results:
             ti['classification'] = new_classification
             ti['auto_class'] = metric
+
+        if progress_callback is not None:
+            progress_callback(done, n_total, cell_id)
 
     return results
