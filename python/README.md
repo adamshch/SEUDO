@@ -26,11 +26,12 @@ viewer).
 ## Install
 
 ```bash
-pip install seudo            # core library only
-pip install seudo[gui]       # + the PyQt5 classification GUI
-pip install seudo[matlab]    # + h5py, for loading real MATLAB v7.3 .mat files
-pip install seudo[all]       # gui + matlab
+pip install seudo
 ```
+
+This includes the PyQt5 classification GUI and h5py (for loading real
+MATLAB v7.3 `.mat` files) as standard dependencies, since the GUI is a
+core part of the workflow, not an add-on.
 
 For local development, from this directory:
 

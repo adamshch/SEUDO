@@ -29,6 +29,9 @@ classifiers = [
 dependencies = [
     "numpy",
     "scipy",
+    "PyQt5",
+    "matplotlib",
+    "h5py",
 ]
 
 [project.urls]
@@ -36,10 +39,7 @@ Homepage = "https://github.com/adamshch/SEUDO"
 Repository = "https://github.com/adamshch/SEUDO"
 
 [project.optional-dependencies]
-gui = ["PyQt5", "matplotlib"]
-matlab = ["h5py"]
-all = ["PyQt5", "matplotlib", "h5py"]
-dev = ["pytest", "PyQt5", "matplotlib", "h5py"]
+dev = ["pytest"]
 
 [build-system]
 requires = ["setuptools>=61", "pybind11>=2.10"]
