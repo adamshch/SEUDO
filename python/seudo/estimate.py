@@ -47,6 +47,63 @@ def _get_frame(movie, frame_index, zero_level):
     return movie[:, :, frame_index].astype(float) - zero_level
 
 
+def _setup_cell_window(
+    profiles, this_cell, y0, y1, x0, x1, min_pix_for_inclusion,
+    lambda_prof, lambda_blob, sigma2_ds, p, one_blob,
+):
+    """Build the ROI/blob-basis/lambda setup for one cell's window -- shared
+    by the per-frame loop below and seudo_residual.py's per-transient
+    single-image fit, so both use identical math for "what SEUDO regresses
+    against" in a given window. y0/y1/x0/x1 are the window bounds (already
+    padded/clamped by the caller)."""
+    n_y = y1 - y0 + 1
+    n_x = x1 - x0 + 1
+    n_blobs = n_y * n_x
+
+    pix_per_profile = np.sum(profiles[y0:y1 + 1, x0:x1 + 1, :] > 0, axis=(0, 1))
+    include = pix_per_profile > min_pix_for_inclusion
+    include[this_cell] = True
+
+    n_cells_window = int(np.sum(include))
+    window_profiles = profiles[y0:y1 + 1, x0:x1 + 1, include]
+    rois = window_profiles.reshape(n_y * n_x, n_cells_window)
+
+    prof_norms = np.sqrt(np.sum(rois ** 2, axis=0))
+
+    lambdas0 = np.concatenate([
+        np.full(n_cells_window, lambda_prof),
+        np.full(n_blobs, lambda_blob),
+    ])
+    k1 = 2 * sigma2_ds * lambdas0
+    pos = lambdas0 > 0
+    k2 = 2 * sigma2_ds * (np.log(1.0 / p - 1.0) - np.sum(np.log(lambdas0[pos])))
+
+    norm_factors = np.concatenate([prof_norms, np.ones(n_blobs)])
+    lambdas = k1 / norm_factors
+
+    cell_index_within = int(np.where(np.flatnonzero(include) == this_cell)[0][0])
+
+    rois_scaled = rois / prof_norms[np.newaxis, :]
+
+    def A(z):
+        z_cells = z[:n_cells_window]
+        z_blob = z[n_cells_window:].reshape(n_y, n_x)
+        out = rois_scaled @ z_cells
+        out = out + convolve2d(z_blob, one_blob, mode='same').ravel()
+        return out
+
+    def At(v):
+        top = rois_scaled.T @ v
+        bottom = convolve2d(v.reshape(n_y, n_x), one_blob, mode='same').ravel()
+        return np.concatenate([top, bottom])
+
+    return dict(
+        n_y=n_y, n_x=n_x, rois=rois, rois_scaled=rois_scaled, norm_factors=norm_factors,
+        lambdas=lambdas, k1=k1, k2=k2, cell_index_within=cell_index_within,
+        n_cells_window=n_cells_window, operators=(A, At), include=include,
+    )
+
+
 def _solve_one_frame_cell(
     this_frame, rois, rois_scaled, lambdas, norm_factors, k1, k2,
     n_y, n_x, one_blob, operators_cc,
@@ -208,59 +265,21 @@ def estimate_time_courses_with_seudo(
         pix_mask[y0:y1 + 1, x0:x1 + 1] = True
         which_pixels[:, cc] = pix_mask.ravel()
 
-        n_y = y1 - y0 + 1
-        n_x = x1 - x0 + 1
-        n_blobs = n_y * n_x
-        n_y_list.append(n_y)
-        n_x_list.append(n_x)
-
-        pix_per_profile = np.sum(profiles[y0:y1 + 1, x0:x1 + 1, :] > 0, axis=(0, 1))
-        include = pix_per_profile > min_pix_for_inclusion
-        include[this_cell] = True
-        which_profiles[:, cc] = include
-
-        n_cells_window = int(np.sum(include))
-        window_profiles = profiles[y0:y1 + 1, x0:x1 + 1, include]
-        rois = window_profiles.reshape(n_y * n_x, n_cells_window)
-        rois_list.append(rois)
-
-        prof_norms = np.sqrt(np.sum(rois ** 2, axis=0))
-
-        lambdas0 = np.concatenate([
-            np.full(n_cells_window, lambda_prof),
-            np.full(n_blobs, lambda_blob),
-        ])
-        k1 = 2 * sigma2_ds * lambdas0
-        pos = lambdas0 > 0
-        k2 = 2 * sigma2_ds * (np.log(1.0 / p - 1.0) - np.sum(np.log(lambdas0[pos])))
-        k1_list.append(k1)
-        k2_list.append(k2)
-
-        norm_factors = np.concatenate([prof_norms, np.ones(n_blobs)])
-        norm_factors_list.append(norm_factors)
-        lambdas_list.append(k1 / norm_factors)
-
-        cell_index_within_list.append(int(np.where(np.flatnonzero(include) == this_cell)[0][0]))
-
-        rois_scaled = rois / prof_norms[np.newaxis, :]
-        rois_scaled_list.append(rois_scaled)
-
-        def make_operators(rois_scaled=rois_scaled, n_y=n_y, n_x=n_x, n_cells_window=n_cells_window):
-            def A(z):
-                z_cells = z[:n_cells_window]
-                z_blob = z[n_cells_window:].reshape(n_y, n_x)
-                out = rois_scaled @ z_cells
-                out = out + convolve2d(z_blob, one_blob, mode='same').ravel()
-                return out
-
-            def At(v):
-                top = rois_scaled.T @ v
-                bottom = convolve2d(v.reshape(n_y, n_x), one_blob, mode='same').ravel()
-                return np.concatenate([top, bottom])
-
-            return A, At
-
-        operators.append(make_operators())
+        setup = _setup_cell_window(
+            profiles, this_cell, y0, y1, x0, x1, min_pix_for_inclusion,
+            lambda_prof, lambda_blob, sigma2_ds, p, one_blob,
+        )
+        n_y_list.append(setup['n_y'])
+        n_x_list.append(setup['n_x'])
+        rois_list.append(setup['rois'])
+        k1_list.append(setup['k1'])
+        k2_list.append(setup['k2'])
+        norm_factors_list.append(setup['norm_factors'])
+        lambdas_list.append(setup['lambdas'])
+        cell_index_within_list.append(setup['cell_index_within'])
+        rois_scaled_list.append(setup['rois_scaled'])
+        operators.append(setup['operators'])
+        which_profiles[:, cc] = setup['include']
 
     # ---- main per-frame loop ----
 

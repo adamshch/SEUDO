@@ -296,8 +296,16 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
         col.addStretch(1)
         return col
 
-    _AUTO_CLASSIFY_CRITERIA = {'correlation': 'corr', 'SEUDO residual': 'res_ratio'}
-    _AUTO_CLASSIFY_DEFAULT_THRESH = {'correlation': 0.4, 'SEUDO residual': 0.5}
+    _AUTO_CLASSIFY_CRITERIA = {
+        'correlation': 'corr',
+        'residual ratio': 'res_ratio',
+        'SEUDO residual': 'seudo_residual',
+    }
+    _AUTO_CLASSIFY_DEFAULT_THRESH = {
+        'correlation': 0.4,
+        'residual ratio': 0.5,
+        'SEUDO residual': 0.5,
+    }
 
     def _build_auto_classify_panel(self):
         group = QtWidgets.QGroupBox('Auto-classify')
@@ -345,10 +353,27 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
         kwargs = dict(criterion=criterion)
         if criterion == 'corr':
             kwargs['corr_thresh'] = threshold
-        else:
+        elif criterion == 'res_ratio':
             kwargs['res_ratio_thresh'] = threshold
+        else:
+            kwargs['seudo_residual_thresh'] = threshold
+            # same underlying SEUDO model as the "Run SEUDO" panel just
+            # below -- reuse its sigma2/lambdaBlob/blobRadius rather than
+            # duplicating a second set of parameter controls
+            kwargs['seudo_kwargs'] = dict(
+                sigma2=self.seudo_sigma2_spin.value(),
+                lambda_blob=self.seudo_lambda_blob_spin.value(),
+                blob_radius=self.seudo_blob_radius_spin.value(),
+            )
 
-        auto_classify_transients(self.se, self.which_struct, overwrite=True, save_results=True, **kwargs)
+        # the seudo_residual criterion runs the real sparse solver once per
+        # transient and can take a while on a large dataset -- give at
+        # least a busy-cursor cue rather than freezing silently
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            auto_classify_transients(self.se, self.which_struct, overwrite=True, save_results=True, **kwargs)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
         self.refresh()
 
     def _build_run_seudo_panel(self):

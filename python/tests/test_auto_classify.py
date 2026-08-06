@@ -127,3 +127,37 @@ def test_res_ratio_criterion_changes_classification(se):
 def test_invalid_criterion_raises(se):
     with pytest.raises(ValueError, match='criterion'):
         auto_classify_transients(se, 'default', which_cells=[0], save_results=False, criterion='bogus')
+
+
+def test_seudo_residual_distinguishes_real_from_contaminated_transient(se):
+    # lambda_blob is scaled to the real demo dataset's pixel intensities by
+    # default; this synthetic fixture's shapes peak around 1.0, so it needs
+    # a much smaller value for any signal to survive the sparsity penalty.
+    results = auto_classify_transients(
+        se, 'default', which_cells=[0], save_results=False, criterion='seudo_residual',
+        seudo_kwargs=dict(lambda_blob=0.1))
+
+    ti0 = se.tc_default['transient_info'][0]
+    real_idx, contam_idx = (0, 1) if ti0['times'][0, 0] < ti0['times'][1, 0] else (1, 0)
+
+    fractions = results[0]['seudoResidual']
+    assert fractions.shape[0] == 2
+    # real transient: SEUDO's own-cell coefficient should closely match the
+    # plain least-squares one (small fraction). Contaminated one: SEUDO
+    # diverts most of the amplitude into the blob basis instead (fraction
+    # much closer to 1).
+    assert fractions[real_idx] < fractions[contam_idx]
+    assert fractions[real_idx] < 0.5
+    assert fractions[contam_idx] > 0.5
+
+
+def test_seudo_residual_thresh_changes_classification(se):
+    results_lenient = auto_classify_transients(
+        se, 'default', which_cells=[0], save_results=False,
+        criterion='seudo_residual', seudo_residual_thresh=1e6)
+    assert np.all(results_lenient[0]['classification'] == VAL_TRUE)
+
+    results_strict = auto_classify_transients(
+        se, 'default', which_cells=[0], save_results=False,
+        criterion='seudo_residual', seudo_residual_thresh=-1.0)
+    assert np.all(results_strict[0]['classification'] == VAL_FALSE)

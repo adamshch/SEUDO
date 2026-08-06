@@ -220,10 +220,47 @@ def test_auto_classify_res_ratio_criterion_uses_res_ratio_thresh(qapp, se, monke
     try:
         monkeypatch.setattr(QtWidgets.QMessageBox, 'question',
                              staticmethod(lambda *a, **k: QtWidgets.QMessageBox.Yes))
-        win.auto_classify_criterion_combo.setCurrentText('SEUDO residual')
+        win.auto_classify_criterion_combo.setCurrentText('residual ratio')
         win.auto_classify_thresh_spin.setValue(1e6)  # lenient in the res-ratio direction
 
         win._on_auto_classify_clicked()
+
+        for cell_idx in range(se.n_cells):
+            ti = se.tc_default['transient_info'][cell_idx]
+            if ti['times'].shape[0] > 0:
+                assert np.all(ti['classification'] == VAL_TRUE)
+    finally:
+        win.close()
+
+
+def test_auto_classify_seudo_residual_criterion_uses_run_seudo_panel_params(qapp, se, monkeypatch):
+    from PyQt5 import QtWidgets
+    import seudo.gui.classify_transients as mod
+
+    win = ClassifyTransientsWindow(se, 'default')
+    try:
+        monkeypatch.setattr(QtWidgets.QMessageBox, 'question',
+                             staticmethod(lambda *a, **k: QtWidgets.QMessageBox.Yes))
+        win.auto_classify_criterion_combo.setCurrentText('SEUDO residual')
+        win.auto_classify_thresh_spin.setValue(1e6)  # lenient -- everything should end up true
+
+        captured = {}
+        orig = mod.auto_classify_transients
+
+        def _spy(*args, **kwargs):
+            captured.update(kwargs)
+            return orig(*args, **kwargs)
+
+        monkeypatch.setattr(mod, 'auto_classify_transients', _spy)
+        win._on_auto_classify_clicked()
+
+        assert captured['criterion'] == 'seudo_residual'
+        assert captured['seudo_residual_thresh'] == 1e6
+        assert captured['seudo_kwargs'] == dict(
+            sigma2=win.seudo_sigma2_spin.value(),
+            lambda_blob=win.seudo_lambda_blob_spin.value(),
+            blob_radius=win.seudo_blob_radius_spin.value(),
+        )
 
         for cell_idx in range(se.n_cells):
             ti = se.tc_default['transient_info'][cell_idx]
@@ -250,6 +287,8 @@ def test_auto_classify_declined_confirmation_leaves_classification_untouched(qap
 def test_auto_classify_criterion_switch_resets_default_threshold(qapp, se):
     win = ClassifyTransientsWindow(se, 'default')
     try:
+        win.auto_classify_criterion_combo.setCurrentText('residual ratio')
+        assert win.auto_classify_thresh_spin.value() == pytest.approx(0.5)
         win.auto_classify_criterion_combo.setCurrentText('SEUDO residual')
         assert win.auto_classify_thresh_spin.value() == pytest.approx(0.5)
         win.auto_classify_criterion_combo.setCurrentText('correlation')

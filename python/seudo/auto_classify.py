@@ -20,6 +20,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 
 from .constants import VAL_FALSE, VAL_TRUE
+from .seudo_residual import compute_seudo_residual_fractions
 from .stats import correlation_vector_matrix
 
 
@@ -50,9 +51,12 @@ def auto_classify_transients(
     res_ratio_mean=True,
     criterion='corr',
     res_ratio_thresh=0.5,
+    seudo_residual_thresh=0.5,
+    seudo_kwargs=None,
 ):
-    if criterion not in ('corr', 'res_ratio'):
-        raise ValueError(f"criterion must be 'corr' or 'res_ratio', got {criterion!r}")
+    if criterion not in ('corr', 'res_ratio', 'seudo_residual'):
+        raise ValueError(
+            f"criterion must be 'corr', 'res_ratio', or 'seudo_residual', got {criterion!r}")
     tc_struct = se._resolve_tc_struct(which_struct)
     if tc_struct.get('transient_info') is None:
         se.compute_transient_info(which_struct)
@@ -83,6 +87,7 @@ def auto_classify_transients(
         blur_profiles_for_fitting=blur_profiles_for_fitting, method='corr',
         corr_thresh=corr_thresh, weighted_trans=weighted_trans, res_ratio_mean=res_ratio_mean,
         criterion=criterion, res_ratio_thresh=res_ratio_thresh,
+        seudo_residual_thresh=seudo_residual_thresh, seudo_kwargs=seudo_kwargs,
     )
 
     results = []
@@ -170,11 +175,19 @@ def auto_classify_transients(
         new_classification = np.full(n_trans, VAL_FALSE)
         if criterion == 'corr':
             new_classification[corrs >= corr_thresh] = VAL_TRUE
-        else:
+        elif criterion == 'res_ratio':
             # high resRatio means the shape isn't well explained by this
             # cell's own profile, i.e. likely contamination -- so *low*
             # resRatio is the "true" direction here, unlike corr.
             new_classification[res_ratios <= res_ratio_thresh] = VAL_TRUE
+        else:
+            # fraction of this cell's own least-squares coefficient that
+            # SEUDO's sparse fit diverts into the unmodeled "blob" basis
+            # instead -- near 0 for a real transient, near 1 for
+            # contamination SEUDO doesn't attribute to this cell.
+            seudo_fractions = compute_seudo_residual_fractions(se, cell_id, ti, **(seudo_kwargs or {}))
+            metric['seudoResidual'] = seudo_fractions
+            new_classification[seudo_fractions <= seudo_residual_thresh] = VAL_TRUE
         is_false = new_classification == VAL_FALSE
         is_true = ~is_false
 
