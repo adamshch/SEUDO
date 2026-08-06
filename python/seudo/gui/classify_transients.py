@@ -89,6 +89,7 @@ class _SeudoRunWorker(QtCore.QThread):
     multi-cell run doesn't freeze the GUI's event loop."""
 
     progress = QtCore.pyqtSignal(int, int, int)  # done, total, cell_idx
+    frame_progress = QtCore.pyqtSignal(int, int, int, int)  # col, cell_idx, frames_done, total_frames
     finished_ok = QtCore.pyqtSignal(dict)
     failed = QtCore.pyqtSignal(str)
 
@@ -104,6 +105,8 @@ class _SeudoRunWorker(QtCore.QThread):
             result = run_seudo_restricted_to_transients(
                 self.se, self.which_struct, which_cells=self.which_cells, verbose=False,
                 progress_callback=lambda done, total, cc: self.progress.emit(done, total, cc),
+                frame_progress_callback=lambda col, cc, done, total: (
+                    self.frame_progress.emit(col, cc, done, total)),
                 **self.seudo_params,
             )
             self.finished_ok.emit(result)
@@ -724,6 +727,11 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
             n_jobs=self.seudo_n_jobs_spin.value(),
         )
 
+    # progress bar resolution *within* one cell -- lets a single-cell run
+    # (which never gets a per-cell progress tick until it's entirely done)
+    # still show smooth intra-cell progress via frame_progress
+    _SEUDO_PROGRESS_RESOLUTION = 1000
+
     def _run_seudo(self, which_cells):
         if getattr(self, '_seudo_worker', None) is not None and self._seudo_worker.isRunning():
             return
@@ -731,12 +739,13 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
         params = self._collect_seudo_params()
         self.run_seudo_one_btn.setEnabled(False)
         self.run_seudo_all_btn.setEnabled(False)
-        self.seudo_progress.setRange(0, len(which_cells))
+        self.seudo_progress.setRange(0, len(which_cells) * self._SEUDO_PROGRESS_RESOLUTION)
         self.seudo_progress.setValue(0)
         self.seudo_status_label.setText(f'Running SEUDO on {len(which_cells)} cell(s)...')
 
         worker = _SeudoRunWorker(self.se, self.which_struct, which_cells, params, self)
         worker.progress.connect(self._on_seudo_progress)
+        worker.frame_progress.connect(self._on_seudo_frame_progress)
         worker.finished_ok.connect(self._on_seudo_finished)
         worker.failed.connect(self._on_seudo_failed)
         self._seudo_worker = worker
@@ -749,8 +758,18 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
         self._run_seudo(list(range(self.se.n_cells)))
 
     def _on_seudo_progress(self, done, total, cell_idx):
-        self.seudo_progress.setValue(done)
+        # snap to the exact cell boundary -- avoids any drift from the
+        # finer-grained frame_progress rounding below
+        self.seudo_progress.setValue(done * self._SEUDO_PROGRESS_RESOLUTION)
         self.seudo_status_label.setText(f'SEUDO: {done}/{total} cell(s) done (last: cell {cell_idx + 1})')
+
+    def _on_seudo_frame_progress(self, col, cell_idx, frames_done, total_frames):
+        if total_frames <= 0:
+            return
+        within_cell = int(self._SEUDO_PROGRESS_RESOLUTION * frames_done / total_frames)
+        self.seudo_progress.setValue(col * self._SEUDO_PROGRESS_RESOLUTION + within_cell)
+        self.seudo_status_label.setText(
+            f'SEUDO: cell {cell_idx + 1}, frame {frames_done}/{total_frames}')
 
     def _on_seudo_finished(self, result):
         self.run_seudo_one_btn.setEnabled(True)

@@ -180,6 +180,7 @@ def estimate_time_courses_with_seudo(
     native_l_mode=2,
     native_nthreads=1,
     n_jobs=1,
+    progress_callback=None,
 ):
     """movie: (Y, X, F) array, or an object with `.shape` and `.get_frame(i)`
     for lazy access (see matlab_io.Hdf5Movie) -- movie data is only ever
@@ -209,6 +210,11 @@ def estimate_time_courses_with_seudo(
         benefit is smaller (NumPy releases the GIL for individual BLAS/ufunc
         calls, but not for the whole per-frame loop). n_jobs=1 (default) runs
         sequentially, identical to earlier versions of this function.
+    progress_callback: if given, called as progress_callback(frames_done,
+        total_frames) each time a frame finishes (summed across every
+        frame_blocks block) -- finer-grained than run_seudo_on_transients.py's
+        own per-cell progress_callback, useful for a GUI progress bar on a
+        single, possibly slow, cell.
 
     Returns a dict with keys 'tc', 'tc_lsq', 'params', 'extras', mirroring
     se.tcSeudo(idx) in the MATLAB version.
@@ -351,6 +357,8 @@ def estimate_time_courses_with_seudo(
                     frames_done += 1
                     if verbose and (frames_done % max(1, n_block_frames // 10) == 0):
                         print(f'  frame {frames_done} of {n_block_frames}')
+                    if progress_callback is not None:
+                        progress_callback(frames_done, n_block_frames)
     finally:
         if executor is not None:
             executor.shutdown()

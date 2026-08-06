@@ -172,3 +172,34 @@ def test_seudo_residual_thresh_changes_classification(se):
         se, 'default', which_cells=[0], save_results=False,
         criterion='seudo_residual', seudo_residual_thresh=1e6)
     assert np.all(results_strict[0]['classification'] == VAL_FALSE)
+
+
+def test_seudo_residual_reuses_cached_values_across_threshold_only_changes(se, monkeypatch):
+    import seudo.auto_classify as mod
+
+    calls = []
+    orig = mod.compute_seudo_residual_fractions
+
+    def _spy(*args, **kwargs):
+        calls.append(1)
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(mod, 'compute_seudo_residual_fractions', _spy)
+
+    auto_classify_transients(
+        se, 'default', which_cells=[0], save_results=False,
+        criterion='seudo_residual', seudo_residual_thresh=0.5, seudo_kwargs=dict(lambda_blob=0.1))
+    assert len(calls) == 1
+
+    # same seudo_kwargs, only the threshold differs -- should reuse the cache
+    results = auto_classify_transients(
+        se, 'default', which_cells=[0], save_results=False,
+        criterion='seudo_residual', seudo_residual_thresh=-1e6, seudo_kwargs=dict(lambda_blob=0.1))
+    assert len(calls) == 1
+    assert np.all(results[0]['classification'] == VAL_TRUE)
+
+    # different seudo_kwargs -- must recompute
+    auto_classify_transients(
+        se, 'default', which_cells=[0], save_results=False,
+        criterion='seudo_residual', seudo_residual_thresh=0.5, seudo_kwargs=dict(lambda_blob=0.2))
+    assert len(calls) == 2

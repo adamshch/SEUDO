@@ -20,7 +20,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 
 from .constants import VAL_FALSE, VAL_TRUE
-from .seudo_residual import compute_seudo_residual_fractions
+from .seudo_residual import SEUDO_RESIDUAL_DEFAULTS, compute_seudo_residual_fractions
 from .stats import correlation_vector_matrix
 
 
@@ -192,7 +192,23 @@ def auto_classify_transients(
             # SEUDO's sparse fit diverts into the unmodeled "blob" basis
             # instead. *high* is the "true" direction here (per explicit
             # user direction) -- unlike resRatio, which uses *low* for true.
-            seudo_fractions = compute_seudo_residual_fractions(se, cell_id, ti, **(seudo_kwargs or {}))
+            #
+            # This calls the real sparse solver once per transient, so it's
+            # the one criterion worth caching: re-running auto-classify with
+            # only the threshold changed (same sigma2/lambdaBlob/blobRadius/
+            # etc.) reuses the cached fractions instead of resolving again.
+            # Cached on ti itself (not the returned metric, which gets
+            # overwritten every call) so it survives across calls even if a
+            # 'corr'/'res_ratio' run happens in between.
+            normalized_kwargs = dict(SEUDO_RESIDUAL_DEFAULTS)
+            normalized_kwargs.update(seudo_kwargs or {})
+            cache = ti.get('seudo_residual_cache')
+            if (cache is not None and cache['seudo_kwargs'] == normalized_kwargs
+                    and cache['values'].shape[0] == n_trans):
+                seudo_fractions = cache['values']
+            else:
+                seudo_fractions = compute_seudo_residual_fractions(se, cell_id, ti, **normalized_kwargs)
+                ti['seudo_residual_cache'] = dict(seudo_kwargs=normalized_kwargs, values=seudo_fractions)
             metric['seudoResidual'] = seudo_fractions
             new_classification[seudo_fractions >= seudo_residual_thresh] = VAL_TRUE
         is_false = new_classification == VAL_FALSE

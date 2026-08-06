@@ -28,6 +28,7 @@ def run_seudo_restricted_to_transients(
     which_cells=None,
     verbose=True,
     progress_callback=None,
+    frame_progress_callback=None,
     **seudo_params,
 ):
     """Run estimate_time_courses_with_seudo for each of which_cells (default:
@@ -36,6 +37,13 @@ def run_seudo_restricted_to_transients(
     progress_callback, if given, is called as progress_callback(done, total,
     cell_idx) after each cell finishes -- lets a caller (e.g. a GUI) report
     progress without depending on stdout.
+
+    frame_progress_callback, if given, is called as
+    frame_progress_callback(col, cell_idx, frames_done, total_frames) as each
+    *frame* within the current cell finishes -- finer-grained than
+    progress_callback, which only fires once a whole cell is done. Useful for
+    a GUI progress bar that shouldn't sit at 0% for the entire duration of a
+    single (possibly slow) cell's run.
 
     Returns a combined result dict (tc/tc_lsq of shape (movF, len(which_cells)))
     and appends it to se.tc_seudo, matching estimate_time_courses_with_seudo's
@@ -67,7 +75,13 @@ def run_seudo_restricted_to_transients(
             t0 = time.time()
             result = estimate_time_courses_with_seudo(
                 se.movie, se.profiles, which_cells=[cell_idx], zero_level=se.zero_level,
-                frame_blocks=blocks, verbose=False, **seudo_params,
+                frame_blocks=blocks, verbose=False,
+                progress_callback=(
+                    None if frame_progress_callback is None
+                    else lambda done, total, col=col, cell_idx=cell_idx: (
+                        frame_progress_callback(col, cell_idx, done, total))
+                ),
+                **seudo_params,
             )
             elapsed = time.time() - t0
             tc[:, col] = result['tc'][:, 0]

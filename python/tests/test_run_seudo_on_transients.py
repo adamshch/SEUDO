@@ -105,3 +105,23 @@ def test_progress_callback_invoked_per_cell(se):
         **COMMON,
     )
     assert calls == [(1, 2, 0), (2, 2, 1)]
+
+
+def test_frame_progress_callback_invoked_per_frame(se):
+    # cell 0 has a single, multi-frame transient block -- progress_callback
+    # alone would report nothing until the *whole* cell finishes, which is
+    # what made the GUI's single-cell progress bar look stuck at 0% then
+    # jump straight to 100%. frame_progress_callback should report smooth,
+    # increasing within-cell progress instead.
+    calls = []
+    run_seudo_restricted_to_transients(
+        se, 'default', which_cells=[0], verbose=False,
+        frame_progress_callback=lambda col, cell_idx, done, total: calls.append((col, cell_idx, done, total)),
+        **COMMON,
+    )
+    assert len(calls) > 1
+    assert all(col == 0 and cell_idx == 0 for col, cell_idx, done, total in calls)
+    assert [c[2] for c in calls] == list(range(1, len(calls) + 1))
+    total_frames = calls[0][3]
+    assert all(c[3] == total_frames for c in calls)
+    assert calls[-1][2] == total_frames
