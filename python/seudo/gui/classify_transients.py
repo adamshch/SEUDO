@@ -290,10 +290,66 @@ class ClassifyTransientsWindow(QtWidgets.QMainWindow):
         load_btn.clicked.connect(self._on_load)
         col.addWidget(load_btn)
 
+        col.addWidget(self._build_auto_classify_panel())
         col.addWidget(self._build_run_seudo_panel())
 
         col.addStretch(1)
         return col
+
+    _AUTO_CLASSIFY_CRITERIA = {'correlation': 'corr', 'SEUDO residual': 'res_ratio'}
+    _AUTO_CLASSIFY_DEFAULT_THRESH = {'correlation': 0.4, 'SEUDO residual': 0.5}
+
+    def _build_auto_classify_panel(self):
+        group = QtWidgets.QGroupBox('Auto-classify')
+        form = QtWidgets.QFormLayout(group)
+
+        self.auto_classify_criterion_combo = QtWidgets.QComboBox()
+        self.auto_classify_criterion_combo.addItems(list(self._AUTO_CLASSIFY_CRITERIA))
+        self.auto_classify_criterion_combo.currentTextChanged.connect(
+            self._on_auto_classify_criterion_changed)
+        form.addRow('Criteria:', self.auto_classify_criterion_combo)
+
+        self.auto_classify_thresh_spin = QtWidgets.QDoubleSpinBox()
+        self.auto_classify_thresh_spin.setDecimals(3)
+        self.auto_classify_thresh_spin.setRange(-1e6, 1e6)
+        self.auto_classify_thresh_spin.setSingleStep(0.05)
+        self.auto_classify_thresh_spin.setValue(self._AUTO_CLASSIFY_DEFAULT_THRESH['correlation'])
+        form.addRow('Threshold:', self.auto_classify_thresh_spin)
+
+        self.auto_classify_btn = QtWidgets.QPushButton('Auto-classify (all cells)')
+        self.auto_classify_btn.clicked.connect(self._on_auto_classify_clicked)
+        form.addRow(self.auto_classify_btn)
+
+        return group
+
+    def _on_auto_classify_criterion_changed(self, criterion_label):
+        # reset to that criterion's natural default -- corr is bounded to
+        # [-1, 1] while resRatio is an unbounded positive ratio, so the two
+        # don't share a sensible threshold value
+        self.auto_classify_thresh_spin.setValue(self._AUTO_CLASSIFY_DEFAULT_THRESH[criterion_label])
+
+    def _on_auto_classify_clicked(self):
+        criterion_label = self.auto_classify_criterion_combo.currentText()
+        criterion = self._AUTO_CLASSIFY_CRITERIA[criterion_label]
+        threshold = self.auto_classify_thresh_spin.value()
+
+        reply = QtWidgets.QMessageBox.question(
+            self, 'Auto-classify',
+            f'This will overwrite the current classification for every transient '
+            f'in every cell, using {criterion_label} vs. threshold {threshold:g}. Continue?',
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        kwargs = dict(criterion=criterion)
+        if criterion == 'corr':
+            kwargs['corr_thresh'] = threshold
+        else:
+            kwargs['res_ratio_thresh'] = threshold
+
+        auto_classify_transients(self.se, self.which_struct, overwrite=True, save_results=True, **kwargs)
+        self.refresh()
 
     def _build_run_seudo_panel(self):
         # port of the core idea in @seudo/parallelSEUDO.m: run SEUDO restricted

@@ -112,3 +112,18 @@ def test_corr_thresh_changes_classification(se):
 
     results_strict = auto_classify_transients(se, 'default', which_cells=[0], save_results=False, corr_thresh=1.1)
     assert np.all(results_strict[0]['classification'] == VAL_FALSE)
+
+
+def test_res_ratio_criterion_changes_classification(se):
+    results_lenient = auto_classify_transients(
+        se, 'default', which_cells=[0], save_results=False, criterion='res_ratio', res_ratio_thresh=1e6)
+    assert np.all(results_lenient[0]['classification'] == VAL_TRUE)
+
+    results_strict = auto_classify_transients(
+        se, 'default', which_cells=[0], save_results=False, criterion='res_ratio', res_ratio_thresh=-1.0)
+    assert np.all(results_strict[0]['classification'] == VAL_FALSE)
+
+
+def test_invalid_criterion_raises(se):
+    with pytest.raises(ValueError, match='criterion'):
+        auto_classify_transients(se, 'default', which_cells=[0], save_results=False, criterion='bogus')

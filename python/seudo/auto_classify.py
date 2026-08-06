@@ -48,7 +48,11 @@ def auto_classify_transients(
     corr_thresh=0.4,
     weighted_trans=False,
     res_ratio_mean=True,
+    criterion='corr',
+    res_ratio_thresh=0.5,
 ):
+    if criterion not in ('corr', 'res_ratio'):
+        raise ValueError(f"criterion must be 'corr' or 'res_ratio', got {criterion!r}")
     tc_struct = se._resolve_tc_struct(which_struct)
     if tc_struct.get('transient_info') is None:
         se.compute_transient_info(which_struct)
@@ -78,6 +82,7 @@ def auto_classify_transients(
         minimum_window=minimum_window, blur_radius=blur_radius,
         blur_profiles_for_fitting=blur_profiles_for_fitting, method='corr',
         corr_thresh=corr_thresh, weighted_trans=weighted_trans, res_ratio_mean=res_ratio_mean,
+        criterion=criterion, res_ratio_thresh=res_ratio_thresh,
     )
 
     results = []
@@ -163,7 +168,13 @@ def auto_classify_transients(
         metric['corrs'] = corrs
 
         new_classification = np.full(n_trans, VAL_FALSE)
-        new_classification[corrs >= corr_thresh] = VAL_TRUE
+        if criterion == 'corr':
+            new_classification[corrs >= corr_thresh] = VAL_TRUE
+        else:
+            # high resRatio means the shape isn't well explained by this
+            # cell's own profile, i.e. likely contamination -- so *low*
+            # resRatio is the "true" direction here, unlike corr.
+            new_classification[res_ratios <= res_ratio_thresh] = VAL_TRUE
         is_false = new_classification == VAL_FALSE
         is_true = ~is_false
 

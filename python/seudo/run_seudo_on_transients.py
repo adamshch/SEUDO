@@ -8,6 +8,8 @@ independent of the others, so sequential vs. parallel execution doesn't
 change the result, only wall-clock time.
 """
 
+import time
+
 import numpy as np
 
 from .estimate import estimate_time_courses_with_seudo
@@ -62,13 +64,18 @@ def run_seudo_restricted_to_transients(
                 print(f'cell {cell_idx}: running SEUDO on {len(blocks)} '
                       f'transient(s), {n_frames_total} frames...')
 
+            t0 = time.time()
             result = estimate_time_courses_with_seudo(
                 se.movie, se.profiles, which_cells=[cell_idx], zero_level=se.zero_level,
                 frame_blocks=blocks, verbose=False, **seudo_params,
             )
+            elapsed = time.time() - t0
             tc[:, col] = result['tc'][:, 0]
             tc_lsq[:, col] = result['tc_lsq'][:, 0]
             per_cell_results[cell_idx] = result
+
+            if verbose:
+                print(f'cell {cell_idx}: done in {elapsed:0.2f}s')
 
         if progress_callback is not None:
             progress_callback(col + 1, len(which_cells), cell_idx)

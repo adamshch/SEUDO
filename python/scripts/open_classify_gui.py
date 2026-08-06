@@ -14,7 +14,7 @@ import time
 import traceback
 
 import h5py
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtWidgets
 
 _orig_excepthook = sys.excepthook
 
@@ -60,10 +60,6 @@ def main():
     win.resize(1400, 900)
     win.show()
     print(f'GUI window opened -- isVisible={win.isVisible()}, entering event loop', flush=True)
-
-    heartbeat = QtCore.QTimer()
-    heartbeat.timeout.connect(lambda: print('heartbeat, still alive', flush=True))
-    heartbeat.start(3000)
 
     exit_code = app.exec_()
     print(f'exec_() returned with code {exit_code}', flush=True)

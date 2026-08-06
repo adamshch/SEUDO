@@ -193,6 +193,71 @@ def test_auto_class_computed_on_open_without_touching_classification(qapp, se):
         win.close()
 
 
+def test_auto_classify_button_writes_classification_for_every_cell(qapp, se, monkeypatch):
+    from PyQt5 import QtWidgets
+
+    win = ClassifyTransientsWindow(se, 'default')
+    try:
+        monkeypatch.setattr(QtWidgets.QMessageBox, 'question',
+                             staticmethod(lambda *a, **k: QtWidgets.QMessageBox.Yes))
+        win.auto_classify_criterion_combo.setCurrentText('correlation')
+        win.auto_classify_thresh_spin.setValue(-1.0)  # lenient -- everything should end up true
+
+        win._on_auto_classify_clicked()
+
+        for cell_idx in range(se.n_cells):
+            ti = se.tc_default['transient_info'][cell_idx]
+            if ti['times'].shape[0] > 0:
+                assert np.all(ti['classification'] == VAL_TRUE)
+    finally:
+        win.close()
+
+
+def test_auto_classify_res_ratio_criterion_uses_res_ratio_thresh(qapp, se, monkeypatch):
+    from PyQt5 import QtWidgets
+
+    win = ClassifyTransientsWindow(se, 'default')
+    try:
+        monkeypatch.setattr(QtWidgets.QMessageBox, 'question',
+                             staticmethod(lambda *a, **k: QtWidgets.QMessageBox.Yes))
+        win.auto_classify_criterion_combo.setCurrentText('SEUDO residual')
+        win.auto_classify_thresh_spin.setValue(1e6)  # lenient in the res-ratio direction
+
+        win._on_auto_classify_clicked()
+
+        for cell_idx in range(se.n_cells):
+            ti = se.tc_default['transient_info'][cell_idx]
+            if ti['times'].shape[0] > 0:
+                assert np.all(ti['classification'] == VAL_TRUE)
+    finally:
+        win.close()
+
+
+def test_auto_classify_declined_confirmation_leaves_classification_untouched(qapp, se, monkeypatch):
+    from PyQt5 import QtWidgets
+
+    win = ClassifyTransientsWindow(se, 'default')
+    try:
+        monkeypatch.setattr(QtWidgets.QMessageBox, 'question',
+                             staticmethod(lambda *a, **k: QtWidgets.QMessageBox.No))
+        win._on_auto_classify_clicked()
+
+        assert np.all(np.isnan(win._cell_transient_info()['classification']))
+    finally:
+        win.close()
+
+
+def test_auto_classify_criterion_switch_resets_default_threshold(qapp, se):
+    win = ClassifyTransientsWindow(se, 'default')
+    try:
+        win.auto_classify_criterion_combo.setCurrentText('SEUDO residual')
+        assert win.auto_classify_thresh_spin.value() == pytest.approx(0.5)
+        win.auto_classify_criterion_combo.setCurrentText('correlation')
+        assert win.auto_classify_thresh_spin.value() == pytest.approx(0.4)
+    finally:
+        win.close()
+
+
 def test_sort_by_residual_ratio_orders_transients_ascending(qapp, se):
     win = ClassifyTransientsWindow(se, 'default')
     try:
