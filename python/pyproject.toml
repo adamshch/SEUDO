@@ -1,6 +1,6 @@
 [project]
 name = "seudo"
-version = "0.0.1"
+version = "0.0.2"
 description = "Python port of the SEUDO calcium-imaging source-extraction toolbox (in progress)"
 readme = "README.md"
 license = "MIT"
