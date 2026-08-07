@@ -134,11 +134,18 @@ class FitParams:
     parallelizes *within* one cell's own solve) to avoid oversubscription.
 
     blob_spacing: only affects the native solver (the pure-Python fallback
-    always places one blob per pixel) -- see estimate_time_courses_with_seudo's
+    always places one blob per pixel, i.e. always behaves as spacing=1
+    regardless of this value) -- see estimate_time_courses_with_seudo's
     docstring for the speed/quality tradeoff (realSEUDO paper finding: a
     coarser blob grid gives more-than-quadratic FISTA speedup with little
-    quality loss). Benchmark on real data before relying on it; see
-    scripts/benchmark_blob_spacing.py."""
+    quality loss). Default changed from 1.0 to 3.0 (2026-08-07) after a
+    real-data benchmark (scripts/benchmark_blob_spacing.py) found spacing
+    2-3 captures most of the speedup with little false-suppression cost,
+    and an internal profile of the native solve found the gradient
+    computation -- whose cost scales with blob-dictionary size -- is
+    essentially the entire per-solve cost (>99%), so this is the
+    single highest-leverage speed knob for streaming discovery on a real
+    movie. Re-benchmark before relying on it for a new dataset/scenario."""
     p: float = 1e-5
     sigma2: float = 0.01
     lambda_blob: float = 20.0
@@ -152,7 +159,7 @@ class FitParams:
     use_native: object = 'auto'
     native_l_mode: int = 2
     native_nthreads: int = 1
-    blob_spacing: float = 1.0
+    blob_spacing: float = 3.0
     n_jobs: int = 1
 
 
