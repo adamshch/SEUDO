@@ -45,7 +45,7 @@ from scipy import ndimage
 from scipy.interpolate import RegularGridInterpolator
 from scipy.signal import convolve2d
 
-from .blob import make_seudo_blob
+from .blob import make_seudo_blob, make_smoothing_kernel
 from .estimate import _setup_cell_window, _solve_one_frame_cell
 from .geometry import compute_roi_coms
 from ._native import NATIVE_AVAILABLE as _NATIVE_AVAILABLE
@@ -177,6 +177,23 @@ class FitParams:
     by roughly that same factor, and the FISTA lambda calibration assumes
     sigma2 reflects the actual noise level of what it's being fit against.
 
+    spatial_denoise_radius: Gaussian radius for smoothing the frame ITSELF
+    (after ds_time's temporal averaging, before anything else -- known-cell
+    fitting included, not just detection). Default None applies no spatial
+    smoothing at all (matches every behavior before this parameter existed).
+    The realSEUDO paper (sec 3.2) explicitly preprocesses each incoming
+    frame with "both a spatial Gaussian filter, as well as a running
+    average of several sequential frames" BEFORE fitting Xstab (known
+    cells) against it -- this module already had the temporal half
+    (ds_time) but was missing the spatial half entirely; the existing
+    DetectionParams.blobify_radius is a DIFFERENT thing (it smooths the
+    residual, only for detection thresholding, never touching the actual
+    fits). Uses a sum-normalized smoothing kernel (blob.make_smoothing_
+    kernel), not make_seudo_blob's L2-normalized SEUDO basis-function
+    convention, which would distort the frame's amplitude scale if used
+    for plain smoothing. Benchmark before relying on it -- untested how
+    much it matters once ds_time is already doing temporal denoising.
+
     n_jobs: number of known cells to fit concurrently within a single frame,
     in a ThreadPoolExecutor (same lever, same rationale, as
     estimate_time_courses_with_seudo's own n_jobs -- each cell's fit is
@@ -215,6 +232,7 @@ class FitParams:
     blob_spacing: float = 3.0
     n_jobs: int = 1
     ds_time: int = 1
+    spatial_denoise_radius: float = None
 
 
 @dataclass
@@ -305,6 +323,10 @@ class StreamingState:
         if blobify_radius is None:
             blobify_radius = self.fit.blob_radius
         self.detect_blob = make_seudo_blob(blobify_radius)
+        self.denoise_kernel = (
+            make_smoothing_kernel(self.fit.spatial_denoise_radius)
+            if self.fit.spatial_denoise_radius is not None else None
+        )
         self.sigma2_ds = self.fit.sigma2 / max(1, self.fit.ds_time)
         self._frame_buffer = deque(maxlen=max(1, self.fit.ds_time))
         self.frame_index = 0
@@ -815,6 +837,13 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     # against avg_frame, never the single raw frame, once ds_time > 1.
     state._frame_buffer.append(frame)
     avg_frame = np.mean(state._frame_buffer, axis=0)
+
+    # spatial denoising, see FitParams.spatial_denoise_radius -- applied
+    # after temporal averaging, before known-cell fitting, matching the
+    # paper's own preprocessing order (both filters denoise the frame
+    # ITSELF, upstream of everything else). None (default): no-op.
+    if state.denoise_kernel is not None:
+        avg_frame = convolve2d(avg_frame, state.denoise_kernel, mode='same')
 
     activity = {}
     reconstruction = np.zeros((state.mov_y, state.mov_x), dtype=float)

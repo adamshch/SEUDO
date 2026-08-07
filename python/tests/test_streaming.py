@@ -743,3 +743,41 @@ def test_start_candidate_tracks_still_creates_a_track_for_a_disjoint_candidate()
     _start_candidate_tracks(state, [far_cand], np.zeros((y, x)), 0, track_footprints)
     assert state._next_track_id == n_before + 1
     assert len(state.candidate_tracks) == 1
+
+
+def test_spatial_denoise_radius_default_is_a_noop():
+    y, x = 20, 20
+    state = StreamingState((y, x), fit=FitParams())
+    assert state.denoise_kernel is None
+
+
+def test_spatial_denoise_radius_builds_a_sum_normalized_kernel():
+    # a smoothing filter must preserve overall intensity (sum to ~1), unlike
+    # make_seudo_blob's L2-normalized SEUDO basis-function convention
+    y, x = 20, 20
+    state = StreamingState((y, x), fit=FitParams(spatial_denoise_radius=1.5))
+    assert state.denoise_kernel is not None
+    np.testing.assert_allclose(state.denoise_kernel.sum(), 1.0, atol=1e-10)
+
+
+def test_spatial_denoise_radius_changes_known_cell_activity_under_pixel_noise():
+    # a single, sharp, few-pixel-wide noise spike landing inside a known
+    # cell's own fit window -- spatial denoising should measurably dilute
+    # it before the fit ever sees it, changing the recovered activity
+    # relative to fitting the raw (undenoised) frame
+    y, x = 30, 30
+    prof = gaussian_patch((y, x), center=(15, 15), sigma=2.0)
+    prof[prof < 0.05 * prof.max()] = 0.0
+
+    frame = prof * 3.0
+    frame[12, 12] += 20.0  # sharp spike, inside the cell's own padded fit window
+
+    def run(spatial_denoise_radius):
+        fit = FitParams(**{**vars(default_streaming_fit()), 'spatial_denoise_radius': spatial_denoise_radius})
+        state = StreamingState((y, x), initial_profiles=prof[:, :, np.newaxis], fit=fit)
+        return realSEUDOfit(frame, state).activity[0]
+
+    undenoised = run(None)
+    denoised = run(1.5)
+    assert not np.isclose(undenoised, denoised), (
+        'spatial denoising should measurably change the fit when a sharp spike is present')
