@@ -11,8 +11,12 @@ contaminant is active.
 """
 
 import numpy as np
+import pytest
 
+from seudo._native import NATIVE_AVAILABLE
 from seudo.estimate import estimate_time_courses_with_seudo
+
+requires_native = pytest.mark.skipif(not NATIVE_AVAILABLE, reason='native extension not built')
 
 
 def gaussian_patch(shape, center, sigma, amplitude=1.0):
@@ -144,3 +148,47 @@ def test_lazy_movie_source_matches_in_memory_array():
     from_lazy = estimate_time_courses_with_seudo(_FakeLazyMovie(movie), profiles, **COMMON_KWARGS)
 
     np.testing.assert_allclose(from_array['tc'], from_lazy['tc'])
+
+
+def test_blob_spacing_defaults_to_one_and_is_recorded_in_params():
+    movie, profiles, _, _ = make_synthetic_movie()
+    result = estimate_time_courses_with_seudo(movie, profiles, **COMMON_KWARGS)
+    assert result['params']['blob_spacing'] == 1.0
+
+
+@requires_native
+def test_blob_spacing_changes_native_result():
+    # blob_spacing only affects the native solver's internal grid -- default
+    # (1, one blob per pixel) vs coarser (4) should give genuinely different
+    # results, confirming the parameter is actually threaded through, not
+    # silently ignored
+    movie, profiles, _, _ = make_synthetic_movie()
+    fine = estimate_time_courses_with_seudo(movie, profiles, use_native=True, blob_spacing=1, **COMMON_KWARGS)
+    coarse = estimate_time_courses_with_seudo(movie, profiles, use_native=True, blob_spacing=4, **COMMON_KWARGS)
+    assert not np.allclose(fine['tc'], coarse['tc'])
+
+
+def test_blob_spacing_is_a_noop_for_python_fallback():
+    # the pure-Python solver has no coarser-grid concept -- always one blob
+    # per pixel regardless of blob_spacing
+    movie, profiles, _, _ = make_synthetic_movie()
+    fine = estimate_time_courses_with_seudo(movie, profiles, use_native=False, blob_spacing=1, **COMMON_KWARGS)
+    coarse = estimate_time_courses_with_seudo(movie, profiles, use_native=False, blob_spacing=4, **COMMON_KWARGS)
+    np.testing.assert_array_equal(fine['tc'], coarse['tc'])
+
+
+@requires_native
+def test_blob_spacing_still_rejects_contamination_at_coarser_grid():
+    # the realSEUDO paper's core claim: a coarser blob grid shouldn't
+    # substantially degrade false-transient rejection quality
+    movie, profiles, cell_activity, _ = make_synthetic_movie()
+    result = estimate_time_courses_with_seudo(
+        movie, profiles, use_native=True, blob_spacing=4, **COMMON_KWARGS)
+    tc_seudo = result['tc'][:, 0]
+
+    contaminant_only = slice(15, 20)
+    seudo_error = np.abs(tc_seudo[contaminant_only] - cell_activity[contaminant_only])
+    assert np.mean(seudo_error) < 1.0  # still suppresses the false signal reasonably well
+
+    cell_only = slice(5, 10)
+    assert np.mean(np.abs(tc_seudo[cell_only] - cell_activity[cell_only])) < 1.0

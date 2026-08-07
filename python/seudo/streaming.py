@@ -108,7 +108,14 @@ class FitParams:
     its whole call, so real multi-core speedup happens even under Python
     threads). n_jobs=1 (default) is sequential, bit-identical to n_jobs>1 --
     only wall-clock time changes. Kept separate from native_nthreads (which
-    parallelizes *within* one cell's own solve) to avoid oversubscription."""
+    parallelizes *within* one cell's own solve) to avoid oversubscription.
+
+    blob_spacing: only affects the native solver (the pure-Python fallback
+    always places one blob per pixel) -- see estimate_time_courses_with_seudo's
+    docstring for the speed/quality tradeoff (realSEUDO paper finding: a
+    coarser blob grid gives more-than-quadratic FISTA speedup with little
+    quality loss). Benchmark on real data before relying on it; see
+    scripts/benchmark_blob_spacing.py."""
     p: float = 1e-5
     sigma2: float = 0.01
     lambda_blob: float = 20.0
@@ -122,6 +129,7 @@ class FitParams:
     use_native: object = 'auto'
     native_l_mode: int = 2
     native_nthreads: int = 1
+    blob_spacing: float = 1.0
     n_jobs: int = 1
 
 
@@ -445,7 +453,7 @@ def _fit_cell(state, frame, cell_id):
         this_frame, setup['rois'], setup['rois_scaled'], setup['lambdas'], setup['norm_factors'],
         setup['k1'], setup['k2'], setup['n_y'], setup['n_x'], state.one_blob, setup['operators'],
         state.use_native, state.fit.native_l_mode, state.fit.native_nthreads,
-        state.fit.solver_tol, state.fit.solver_max_iter,
+        state.fit.solver_tol, state.fit.solver_max_iter, state.fit.blob_spacing,
     )
     return float(fit_fancy[setup['cell_index_within']]), (y0, y1, x0, x1)
 

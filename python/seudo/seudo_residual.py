@@ -36,7 +36,7 @@ from ._native import NATIVE_AVAILABLE as _NATIVE_AVAILABLE
 SEUDO_RESIDUAL_DEFAULTS = dict(
     sigma2=0.0020, lambda_blob=10.0, blob_radius=3.0, lambda_prof=0.0, p=1e-5,
     min_pix_for_inclusion=1, solver_tol=0.01, solver_max_iter=1000,
-    use_native='auto', native_l_mode=2, native_nthreads=1,
+    use_native='auto', native_l_mode=2, native_nthreads=1, blob_spacing=1.0,
 )
 
 
@@ -78,7 +78,7 @@ def compute_seudo_residual_fractions(se, cell_id, ti, **seudo_kwargs):
             setup['norm_factors'], setup['k1'], setup['k2'],
             setup['n_y'], setup['n_x'], one_blob, setup['operators'],
             use_native, params['native_l_mode'], params['native_nthreads'],
-            params['solver_tol'], params['solver_max_iter'],
+            params['solver_tol'], params['solver_max_iter'], params['blob_spacing'],
         )
 
         coef_lsq = tc_lsq_frame[idx]

@@ -108,17 +108,23 @@ def _solve_one_frame_cell(
     this_frame, rois, rois_scaled, lambdas, norm_factors, k1, k2,
     n_y, n_x, one_blob, operators_cc,
     use_native, native_l_mode, native_nthreads, solver_tol, solver_max_iter,
+    blob_spacing=1.0,
 ):
     """Solve one (frame, cell) pair -- independent of every other frame and
     cell, which is what makes this safe to run concurrently (see n_jobs on
     estimate_time_courses_with_seudo). No shared mutable state is touched:
-    everything here is either a local or a read-only array/closure."""
+    everything here is either a local or a read-only array/closure.
+
+    blob_spacing: only affects the native solver (the pure-Python fallback
+    always places one blob per pixel, i.e. spacing=1, with no coarser-grid
+    option) -- see estimate_time_courses_with_seudo's docstring for the
+    speed/quality tradeoff this controls."""
     n_cells_window = rois.shape[1]
     tc_lsq_frame = np.linalg.solve(rois.T @ rois, rois.T @ this_frame)
 
     if use_native:
         fit_weights, _n_steps, _log = _native_seudo_solve(
-            this_frame.reshape(n_y, n_x), one_blob, 1.0,
+            this_frame.reshape(n_y, n_x), one_blob, blob_spacing,
             rois_scaled, np.zeros(0), lambdas,
             solver_tol, solver_max_iter, native_l_mode, 0, False, native_nthreads,
         )
@@ -179,6 +185,7 @@ def estimate_time_courses_with_seudo(
     use_native='auto',
     native_l_mode=2,
     native_nthreads=1,
+    blob_spacing=1.0,
     n_jobs=1,
     progress_callback=None,
 ):
@@ -201,6 +208,18 @@ def estimate_time_courses_with_seudo(
         reasonable default.
     native_nthreads: threads the native solver uses *within* a single frame's
         solve (independent of any outer parallelism).
+    blob_spacing: only affects the native solver (>=1, pixel spacing of the
+        blob dictionary grid; 1 = one blob per pixel, the default and the
+        pure-Python fallback's only behavior). The realSEUDO paper
+        (Dmitrieva, Babkin & Charles, NeurIPS 2024) found placing a blob at
+        every pixel is highly redundant -- every pixel ends up covered by
+        pi*r^2 overlapping kernels -- and that a coarser grid cuts FISTA's
+        step count and per-step cost with more-than-quadratic net speedup
+        (>100x for a 30px-diameter kernel in their benchmarks), without
+        substantial loss of false-transient rejection or contamination-shape
+        recognition. This is a real speed/quality tradeoff, not a free
+        lunch -- benchmark on your own data before relying on it; see
+        scripts/benchmark_blob_spacing.py for a real-data sweep.
     n_jobs: number of (frame, cell) solves to run concurrently in a thread
         pool. Each is fully independent (see _solve_one_frame_cell), so this
         changes wall-clock time only, never the result. Most effective with
@@ -335,6 +354,7 @@ def estimate_time_courses_with_seudo(
                     norm_factors_list[cc], k1_list[cc], k2_list[cc],
                     n_y_list[cc], n_x_list[cc], one_blob, operators[cc],
                     use_native, native_l_mode, native_nthreads, solver_tol, solver_max_iter,
+                    blob_spacing,
                 )
 
             work_items = [(ff, cc) for ff in range(block_start, block_end + 1)
@@ -368,7 +388,7 @@ def estimate_time_courses_with_seudo(
         ds_time=ds_time, lambda_prof=lambda_prof,
         min_pix_for_inclusion=min_pix_for_inclusion, pad_space=pad_space,
         use_com=use_com, which_cells=which_cells, frame_blocks=blocks,
-        use_native=use_native, n_jobs=n_jobs,
+        use_native=use_native, n_jobs=n_jobs, blob_spacing=blob_spacing,
     )
     extras = dict(
         lsq_costs=lsq_costs, bob_costs=bob_costs,

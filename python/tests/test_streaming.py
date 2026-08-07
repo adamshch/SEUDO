@@ -4,10 +4,14 @@ detecting and promoting new cells as they appear.
 """
 
 import numpy as np
+import pytest
 
+from seudo._native import NATIVE_AVAILABLE
 from seudo.estimate import estimate_time_courses_with_seudo
 from seudo.geometry import compute_roi_coms
 from seudo.streaming import FitParams, StreamingState, TilingConfig, realSEUDOfit
+
+requires_native = pytest.mark.skipif(not NATIVE_AVAILABLE, reason='native extension not built')
 
 COMMON_FIT = dict(p=1e-4, sigma2=0.02, lambda_blob=1.0, blob_radius=1.2, pad_space=6,
                    solver_tol=0.01, solver_max_iter=500, use_native=False)
@@ -265,3 +269,49 @@ def test_state_contract_sanity():
             n_before = state.profiles.shape[2]
         else:
             assert state.profiles.shape[2] == n_before
+
+
+def make_contaminated_frames(seed=5, y=30, x=30, n_frames=20):
+    """A single known cell plus a withheld, overlapping 'contaminant' --
+    unlike make_multi_cell_movie (clean, no interference, so LSQ always
+    wins the cost comparison and the blob dictionary is never engaged
+    regardless of spacing), this scenario actually exercises the blob
+    branch, which is where blob_spacing has any effect at all."""
+    yy, xx = np.mgrid[0:y, 0:x]
+    prof0 = gaussian_patch((y, x), center=(15, 15), sigma=2.0)
+    prof0[prof0 < 0.05 * prof0.max()] = 0.0
+    contaminant = gaussian_patch((y, x), center=(19, 19), sigma=2.0)
+    contaminant[contaminant < 0.05 * contaminant.max()] = 0.0
+
+    rng = np.random.default_rng(seed)
+    frames = [prof0 * 4.0 + contaminant * 12.0 + 0.02 * rng.normal(size=(y, x)) for _ in range(n_frames)]
+    return frames, prof0[:, :, np.newaxis], (y, x)
+
+
+@requires_native
+def test_blob_spacing_changes_native_result():
+    frames, profiles, (y, x) = make_contaminated_frames()
+
+    def run(blob_spacing):
+        fit = FitParams(sigma2=0.02, lambda_blob=1.0, blob_radius=1.2, pad_space=6,
+                         use_native=True, blob_spacing=blob_spacing, solver_max_iter=300)
+        state = StreamingState((y, x), initial_profiles=profiles, fit=fit)
+        return [realSEUDOfit(frame, state).activity[0] for frame in frames]
+
+    fine = run(1)
+    coarse = run(4)
+    assert not np.allclose(fine, coarse)
+
+
+def test_blob_spacing_is_a_noop_for_python_fallback():
+    frames, profiles, (y, x) = make_contaminated_frames()
+
+    def run(blob_spacing):
+        fit = FitParams(sigma2=0.02, lambda_blob=1.0, blob_radius=1.2, pad_space=6,
+                         use_native=False, blob_spacing=blob_spacing, solver_max_iter=300)
+        state = StreamingState((y, x), initial_profiles=profiles, fit=fit)
+        return [realSEUDOfit(frame, state).activity[0] for frame in frames]
+
+    fine = run(1)
+    coarse = run(4)
+    np.testing.assert_array_equal(fine, coarse)
