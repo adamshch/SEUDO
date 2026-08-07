@@ -592,6 +592,18 @@ def _subtract_tracked_contributions(state, residual):
     centroid matching that keeps advancing each track's own progress (see
     _update_candidate_tracks).
 
+    Fits every track's profile JOINTLY, not in isolation: all active
+    tracks' current profiles are stacked into one array and passed to
+    _setup_cell_window together, the same way state.profiles (ALL known
+    cells) is passed for a known cell's own fit -- so _setup_cell_window's
+    existing "include any other profile with enough pixels in this window"
+    logic automatically pulls in any OTHER active track that spatially
+    overlaps this one's window. Fitting each track in total isolation, as
+    an earlier version of this function did, let two nearby candidates each
+    try to independently explain the same shared residual with no
+    awareness of each other -- unlike known cells, whose fits already share
+    a window (and thus disambiguate each other) when they overlap.
+
     Returns (residual2, exclude_mask, track_footprints): exclude_mask is the
     union of every active track's (dilated) footprint regardless of this
     frame's fitted weight -- a track's own territory should never spawn a
@@ -599,7 +611,7 @@ def _subtract_tracked_contributions(state, residual):
     weak. track_footprints is [(track_id, tight_mask, tight_bbox), ...] --
     the UNPADDED (tight-to-the-actual-observed-footprint) mask/bbox each
     track's own _build_promoted_profile already computed, reused by
-    _merge_or_start_tracks for the Eq. 8 merge-on-create check so it isn't
+    _start_candidate_tracks for the Eq. 8 merge-on-create check so it isn't
     recomputed a second time per candidate."""
     residual2 = residual.copy()
     exclude_mask = np.zeros((state.mov_y, state.mov_x), dtype=bool)
@@ -607,17 +619,21 @@ def _subtract_tracked_contributions(state, residual):
     structure = np.ones((2 * r + 1, 2 * r + 1), dtype=bool) if r > 0 else None
     track_footprints = []
 
-    for track_id, track in state.candidate_tracks.items():
-        profile, tight_bbox = _build_promoted_profile(track, (state.mov_y, state.mov_x))
-        tby0, tby1, tbx0, tbx1 = tight_bbox
+    track_ids = list(state.candidate_tracks.keys())
+    built = [_build_promoted_profile(state.candidate_tracks[tid], (state.mov_y, state.mov_x)) for tid in track_ids]
+    combined_profiles = np.stack([profile for profile, _bbox in built], axis=2)
+
+    for i, track_id in enumerate(track_ids):
+        profile = combined_profiles[:, :, i]
+        tby0, tby1, tbx0, tbx1 = built[i][1]
         tight_mask = profile[tby0:tby1 + 1, tbx0:tbx1 + 1] > 0
-        track_footprints.append((track_id, tight_mask, tight_bbox))
+        track_footprints.append((track_id, tight_mask, built[i][1]))
 
         y0, y1, x0, x1 = _cell_window_bounds(profile, state.fit.pad_space, state.mov_y, state.mov_x, state.fit.use_com)
         footprint = profile[y0:y1 + 1, x0:x1 + 1] > 0
 
         setup = _setup_cell_window(
-            profile[:, :, np.newaxis], 0, y0, y1, x0, x1, state.fit.min_pix_for_inclusion,
+            combined_profiles, i, y0, y1, x0, x1, state.fit.min_pix_for_inclusion,
             state.fit.lambda_prof, state.fit.lambda_blob, state.sigma2_ds, state.fit.p, state.one_blob,
         )
         this_residual = residual[y0:y1 + 1, x0:x1 + 1].ravel()

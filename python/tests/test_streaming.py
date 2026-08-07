@@ -512,6 +512,46 @@ def test_subtract_tracked_contributions_removes_tracked_signal():
     assert exclude_mask[15, 15], 'the tracked footprint should be excluded from new-candidate scanning'
 
 
+def test_subtract_tracked_contributions_fits_overlapping_tracks_jointly():
+    # two active tracks whose profiles genuinely overlap (spatially close
+    # Gaussians) -- fitting each in total isolation against a residual that
+    # actually contains BOTH signals would misattribute the overlap region
+    # (each track's lone-column LSQ has no way to know the other profile's
+    # contribution exists), leaving real residual behind. A joint fit
+    # (both tracks sharing one window, like known cells already do) should
+    # correctly decompose the two and drive the residual down everywhere.
+    from seudo.streaming import CandidateTrack, _subtract_tracked_contributions
+
+    y, x = 30, 30
+    prof_a = gaussian_patch((y, x), center=(15, 13), sigma=2.0)
+    prof_a[prof_a < 0.05 * prof_a.max()] = 0.0
+    prof_b = gaussian_patch((y, x), center=(15, 17), sigma=2.0)  # 4px away -- real overlap
+    prof_b[prof_b < 0.05 * prof_b.max()] = 0.0
+
+    state = StreamingState((y, x), fit=default_streaming_fit())
+
+    def make_track(prof, bbox):
+        crop = prof[bbox[0]:bbox[1] + 1, bbox[2]:bbox[3] + 1]
+        mask = crop > 0
+        return CandidateTrack(centroid=(15.0, 15.0), consecutive_frames=3, gap=0,
+                               history=[(0, bbox, mask, crop * 3.0)] * 3)
+
+    bbox_a = (10, 20, 8, 18)
+    bbox_b = (10, 20, 12, 22)
+    state.candidate_tracks[0] = make_track(prof_a, bbox_a)
+    state.candidate_tracks[1] = make_track(prof_b, bbox_b)
+
+    true_weight_a, true_weight_b = 3.0, 5.0
+    residual = prof_a * true_weight_a + prof_b * true_weight_b  # clean, no noise
+
+    residual2, _exclude_mask, _track_footprints = _subtract_tracked_contributions(state, residual)
+
+    combined_footprint = (prof_a > 0) | (prof_b > 0)
+    assert np.abs(residual2[combined_footprint]).max() < 0.1 * max(true_weight_a, true_weight_b), (
+        'jointly fitting overlapping tracks should decompose both signals correctly, '
+        'not leave real residual from misattributing the overlap region')
+
+
 def test_tracked_candidate_never_spawns_a_duplicate_track():
     # while a real cell is being tracked (pre-promotion), the two-stage
     # subtraction should keep explaining its own signal away every frame --
