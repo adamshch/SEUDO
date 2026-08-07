@@ -592,17 +592,27 @@ def _subtract_tracked_contributions(state, residual):
     centroid matching that keeps advancing each track's own progress (see
     _update_candidate_tracks).
 
-    Returns (residual2, exclude_mask): exclude_mask is the union of every
-    active track's (dilated) footprint regardless of this frame's fitted
-    weight -- a track's own territory should never spawn a duplicate new
-    track even on a frame its regression fit happens to be weak."""
+    Returns (residual2, exclude_mask, track_footprints): exclude_mask is the
+    union of every active track's (dilated) footprint regardless of this
+    frame's fitted weight -- a track's own territory should never spawn a
+    duplicate new track even on a frame its regression fit happens to be
+    weak. track_footprints is [(track_id, tight_mask, tight_bbox), ...] --
+    the UNPADDED (tight-to-the-actual-observed-footprint) mask/bbox each
+    track's own _build_promoted_profile already computed, reused by
+    _merge_or_start_tracks for the Eq. 8 merge-on-create check so it isn't
+    recomputed a second time per candidate."""
     residual2 = residual.copy()
     exclude_mask = np.zeros((state.mov_y, state.mov_x), dtype=bool)
     r = state.detection.exclude_radius_known_cells
     structure = np.ones((2 * r + 1, 2 * r + 1), dtype=bool) if r > 0 else None
+    track_footprints = []
 
-    for track in state.candidate_tracks.values():
-        profile, _history_bbox = _build_promoted_profile(track, (state.mov_y, state.mov_x))
+    for track_id, track in state.candidate_tracks.items():
+        profile, tight_bbox = _build_promoted_profile(track, (state.mov_y, state.mov_x))
+        tby0, tby1, tbx0, tbx1 = tight_bbox
+        tight_mask = profile[tby0:tby1 + 1, tbx0:tbx1 + 1] > 0
+        track_footprints.append((track_id, tight_mask, tight_bbox))
+
         y0, y1, x0, x1 = _cell_window_bounds(profile, state.fit.pad_space, state.mov_y, state.mov_x, state.fit.use_com)
         footprint = profile[y0:y1 + 1, x0:x1 + 1] > 0
 
@@ -624,16 +634,64 @@ def _subtract_tracked_contributions(state, residual):
         dilated = ndimage.binary_dilation(footprint, structure=structure) if structure is not None else footprint
         exclude_mask[y0:y1 + 1, x0:x1 + 1] |= dilated
 
-    return residual2, exclude_mask
+    return residual2, exclude_mask, track_footprints
 
 
-def _start_candidate_tracks(state, raw_candidates, residual, frame_index):
-    """Stage 2: every raw candidate detected on residual2 (see
-    _subtract_tracked_contributions) already excludes every currently-active
-    track's footprint, so each one is by construction a genuinely new
-    candidate -- no matching against existing tracks needed, just start
-    tracking it."""
+def _should_merge_temp_profiles(mask_a, bbox_a, mask_b, bbox_b, k_temp=0.75):
+    """realSEUDO paper Eq. 8 (sec 3.2): merge condition for two candidate
+    ("temporary") profiles. Captures the logic that a close spatial match,
+    or one profile mostly contained within the other (only a perimeter-ish
+    sliver sticking out), likely represents the same underlying cell rather
+    than two genuinely separate ones -- as opposed to a plain "do they
+    overlap at all" test, which would also merge two cells that happen to
+    be adjacent.
+
+    P1, P2: total pixel counts. U1, U2: pixels unique to each (not shared).
+    C: shared pixel count. B1, B2: bounding-box perimeters.
+        U1 <= B1*0.5  or  U2 <= B2*0.5  or  C >= k_temp * min(P1, P2)
+
+    mask_a/mask_b are LOCAL boolean masks matching bbox_a/bbox_b's shape
+    (the RawCandidate/track-footprint convention used throughout this
+    module); bboxes are (y0, y1, x0, x1), inclusive, global frame coords."""
+    ay0, ay1, ax0, ax1 = bbox_a
+    by0, by1, bx0, bx1 = bbox_b
+
+    iy0, iy1 = max(ay0, by0), min(ay1, by1)
+    ix0, ix1 = max(ax0, bx0), min(ax1, bx1)
+    if iy0 > iy1 or ix0 > ix1:
+        return False  # bounding boxes don't even overlap
+
+    sub_a = mask_a[iy0 - ay0:iy1 - ay0 + 1, ix0 - ax0:ix1 - ax0 + 1]
+    sub_b = mask_b[iy0 - by0:iy1 - by0 + 1, ix0 - bx0:ix1 - bx0 + 1]
+    c = int(np.logical_and(sub_a, sub_b).sum())
+    if c == 0:
+        return False
+
+    p1, p2 = int(mask_a.sum()), int(mask_b.sum())
+    u1, u2 = p1 - c, p2 - c
+    b1 = 2 * ((ay1 - ay0 + 1) + (ax1 - ax0 + 1))
+    b2 = 2 * ((by1 - by0 + 1) + (bx1 - bx0 + 1))
+
+    return u1 <= b1 * 0.5 or u2 <= b2 * 0.5 or c >= k_temp * min(p1, p2)
+
+
+def _start_candidate_tracks(state, raw_candidates, residual, frame_index, track_footprints):
+    """Stage 2: a raw candidate detected on residual2 (see
+    _subtract_tracked_contributions) is usually genuinely new, since R2
+    already excludes every currently-active track's (dilated) footprint --
+    but that exclusion is deliberately not the only line of defense (its
+    dilation radius is a tunable, sometimes tight, detection knob, not a
+    correctness guarantee). Before starting a new track, run the paper's
+    Eq. 8 merge-on-create check (_should_merge_temp_profiles) against every
+    existing track's own tight footprint: a candidate that's really just
+    leftover, imperfectly-subtracted residual from a track already being
+    followed gets silently absorbed (no state change) instead of spawning
+    a spurious duplicate."""
     for cand in raw_candidates:
+        if any(_should_merge_temp_profiles(cand.mask, cand.bbox, mask, bbox)
+               for _tid, mask, bbox in track_footprints):
+            continue
+
         track_id = state._next_track_id
         state._next_track_id += 1
         y0, y1, x0, x1 = cand.bbox
@@ -790,13 +848,14 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     # a handful of frames), so this avoids a redundant convolution + full
     # tile scan on the common case, not an approximation.
     if state.candidate_tracks:
-        residual2, candidate_exclude_mask = _subtract_tracked_contributions(state, residual)
+        residual2, candidate_exclude_mask, track_footprints = _subtract_tracked_contributions(state, residual)
         combined_exclude_mask = state.known_cell_exclude_mask | candidate_exclude_mask
         smoothed2 = convolve2d(residual2, state.detect_blob, mode='same')
         raw_candidates_new = _run_tile_detection(state, smoothed2, noise_map, combined_exclude_mask)
     else:
         raw_candidates_new = raw_candidates
-    _start_candidate_tracks(state, raw_candidates_new, residual, frame_index)
+        track_footprints = []
+    _start_candidate_tracks(state, raw_candidates_new, residual, frame_index, track_footprints)
 
     new_cells = []
     ready = [tid for tid, t in state.candidate_tracks.items()

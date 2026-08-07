@@ -504,7 +504,7 @@ def test_subtract_tracked_contributions_removes_tracked_signal():
 
     rng = np.random.default_rng(0)
     residual = prof * 3.0 + 0.01 * rng.normal(size=(y, x))
-    residual2, exclude_mask = _subtract_tracked_contributions(state, residual)
+    residual2, exclude_mask, track_footprints = _subtract_tracked_contributions(state, residual)
 
     footprint = prof > 0
     assert np.abs(residual2[footprint]).sum() < 0.5 * np.abs(residual[footprint]).sum(), (
@@ -630,3 +630,76 @@ def test_blobify_radius_override_produces_a_different_kernel():
     detection = DetectionParams(blobify_radius=1.2)
     state = StreamingState((y, x), fit=fit, detection=detection)
     assert state.detect_blob.shape != state.one_blob.shape
+
+
+def test_should_merge_temp_profiles_eq8():
+    # direct check of the paper's Eq. 8 merge condition (realSEUDO sec 3.2),
+    # independent of the rest of the tracking machinery
+    from seudo.streaming import _should_merge_temp_profiles
+
+    # profile B is a 3x3 block fully contained within a 10x10 profile A --
+    # B's every pixel is shared, so U_b=0 <= B_b*0.5 trivially: merge
+    mask_a = np.ones((10, 10), dtype=bool)
+    bbox_a = (0, 9, 0, 9)
+    mask_b = np.ones((3, 3), dtype=bool)
+    bbox_b = (4, 6, 4, 6)
+    assert _should_merge_temp_profiles(mask_a, bbox_a, mask_b, bbox_b) is True
+
+    # two same-size blocks overlapping by only one corner pixel out of 9 --
+    # low common fraction, high unique fraction relative to their own small
+    # perimeters: should NOT merge, this is two separate small profiles
+    mask_c = np.ones((3, 3), dtype=bool)
+    bbox_c = (0, 2, 0, 2)
+    mask_d = np.ones((3, 3), dtype=bool)
+    bbox_d = (2, 4, 2, 4)
+    assert _should_merge_temp_profiles(mask_c, bbox_c, mask_d, bbox_d) is False
+
+    # disjoint bounding boxes: never merge
+    mask_e = np.ones((3, 3), dtype=bool)
+    bbox_e = (0, 2, 0, 2)
+    mask_f = np.ones((3, 3), dtype=bool)
+    bbox_f = (20, 22, 20, 22)
+    assert _should_merge_temp_profiles(mask_e, bbox_e, mask_f, bbox_f) is False
+
+
+def test_start_candidate_tracks_absorbs_a_candidate_overlapping_an_existing_track():
+    # a raw candidate that's really just leftover, imperfectly-subtracted
+    # residual from a track already being followed (Eq. 8 merge condition
+    # satisfied) should be silently absorbed, not spawn a duplicate track --
+    # this is the mechanism meant to compensate for a tight
+    # exclude_radius_known_cells not fully covering a track's footprint
+    from seudo.streaming import RawCandidate, _start_candidate_tracks
+
+    y, x = 30, 30
+    state = StreamingState((y, x), fit=default_streaming_fit())
+    existing_mask = np.ones((10, 10), dtype=bool)
+    existing_bbox = (5, 14, 5, 14)
+    track_footprints = [(0, existing_mask, existing_bbox)]
+
+    # a small candidate almost entirely inside the existing track's bbox
+    overlapping_cand = RawCandidate(
+        centroid=(9.0, 9.0), bbox=(8, 10, 8, 10), mask=np.ones((3, 3), dtype=bool))
+
+    n_before = state._next_track_id
+    _start_candidate_tracks(state, [overlapping_cand], np.zeros((y, x)), 0, track_footprints)
+    assert state._next_track_id == n_before, 'an Eq.8-merging candidate should not start a new track'
+    assert len(state.candidate_tracks) == 0
+
+
+def test_start_candidate_tracks_still_creates_a_track_for_a_disjoint_candidate():
+    # sanity check the Eq. 8 filter doesn't over-suppress -- a candidate far
+    # from every existing track should still start a genuinely new one
+    from seudo.streaming import RawCandidate, _start_candidate_tracks
+
+    y, x = 30, 30
+    state = StreamingState((y, x), fit=default_streaming_fit())
+    existing_mask = np.ones((5, 5), dtype=bool)
+    existing_bbox = (2, 6, 2, 6)
+    track_footprints = [(0, existing_mask, existing_bbox)]
+
+    far_cand = RawCandidate(centroid=(25.0, 25.0), bbox=(23, 27, 23, 27), mask=np.ones((5, 5), dtype=bool))
+
+    n_before = state._next_track_id
+    _start_candidate_tracks(state, [far_cand], np.zeros((y, x)), 0, track_footprints)
+    assert state._next_track_id == n_before + 1
+    assert len(state.candidate_tracks) == 1
