@@ -38,9 +38,10 @@ from ._native import NATIVE_AVAILABLE as _NATIVE_AVAILABLE
 class TilingConfig:
     """tile_shape=None (default): one tile spanning the whole frame -- no
     behavior change from an untiled design. Tiling only ever scopes the
-    *candidate-detection* pass (see _detect_candidate_blobs); known-cell
-    fitting always uses each cell's own window regardless of tiling, since
-    _setup_cell_window already builds that window independent of any grid."""
+    *candidate-detection* pass (see _tile_threshold_mask/_detect_in_tile);
+    known-cell fitting always uses each cell's own window regardless of
+    tiling, since _setup_cell_window already builds that window independent
+    of any grid."""
     tile_shape: tuple = None  # (tile_ht, tile_wd) or None
     overlap: int = 15         # halo pixels borrowed from neighboring tiles on each side
 
@@ -288,22 +289,35 @@ def _estimate_noise_level(residual):
     return float(np.median(residual) - np.min(residual))
 
 
-def _detect_candidate_blobs(smoothed, noise_lvl, tile, exclude_mask, detection):
+def _tile_threshold_mask(smoothed, noise_lvl, tile, exclude_mask, detection):
+    """The cheap part of tile detection: crop + threshold + exclude, nothing
+    else. Meant to run sequentially over every tile before any thread-pool
+    submission -- a plain boolean comparison is fast enough that doing it
+    for every tile up front, in this thread, costs less than the overhead
+    of farming it out, and it's what lets "blanking" (below) skip a tile
+    without ever touching the executor at all.
+
+    Returns (crop, mask) if mask has any True pixel, else None ("blanking":
+    nothing here could possibly pass threshold, so the caller can skip this
+    tile completely -- correctness-neutral, since the expensive dilate+
+    label+filter passes below would find zero candidates here too)."""
     hy0, hy1, hx0, hx1 = tile.halo
-    cy0, cy1, cx0, cx1 = tile.core
     crop = smoothed[hy0:hy1 + 1, hx0:hx1 + 1]
     excl = exclude_mask[hy0:hy1 + 1, hx0:hx1 + 1]
 
     cutoff = detection.cutoff_multiplier * noise_lvl
     mask = (crop > cutoff) & ~excl
 
-    if not mask.any():
-        # "blanking": nothing in this tile could possibly pass threshold, so
-        # skip the more expensive dilate+label+per-component-filter passes
-        # entirely -- correctness-neutral (they'd find zero candidates too),
-        # purely a speedup for large FOVs where most tiles are background
-        # most of the time (per realSEUDO paper's own flagged future work)
-        return []
+    return (crop, mask) if mask.any() else None
+
+
+def _detect_in_tile(crop, mask, tile, noise_lvl, detection):
+    """The expensive part of tile detection: dilate + connected-component
+    label + per-component size/brightness filtering. Only ever called for a
+    tile _tile_threshold_mask already found non-blank -- this is the part
+    worth parallelizing across tiles (see realSEUDOfit)."""
+    hy0, _hy1, hx0, _hx1 = tile.halo
+    cy0, cy1, cx0, cx1 = tile.core
 
     if detection.mask_blur_rad > 0:
         r = detection.mask_blur_rad
@@ -513,23 +527,33 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     smoothed = convolve2d(residual, state.one_blob, mode='same')
     noise_lvl = _estimate_noise_level(residual)
 
+    # phase 1 (always sequential): the cheap crop+threshold+exclude check
+    # for every tile. A plain boolean comparison is fast enough that
+    # submitting it to the thread pool would cost more than it saves, and
+    # doing it here is what lets a blank tile skip the executor entirely
+    # rather than paying submission/sync overhead for work that turns out
+    # to be free -- see _tile_threshold_mask.
+    non_blank_tiles = []
+    for tile in state.tiles:
+        hit = _tile_threshold_mask(smoothed, noise_lvl, tile, state.known_cell_exclude_mask, state.detection)
+        if hit is not None:
+            non_blank_tiles.append((tile, hit))
+
+    # phase 2 (parallel when worthwhile): dilate + label + filter, only for
+    # tiles phase 1 found non-blank. Each only reads its own crop/mask (never
+    # mutates them), so this is safe to run concurrently. Reuses the same
+    # pool as cell-fitting rather than a second one: detection always runs
+    # after fitting completes within one frame, never concurrently with it,
+    # so there's no new oversubscription from sharing it.
     raw_candidates = []
-    if state._executor is not None and len(state.tiles) > 1:
-        # each tile's detection pass only reads smoothed/exclude_mask (never
-        # mutates them -- numpy slicing/comparison/dilation all produce new
-        # arrays), so this is safe to run concurrently. Reuses the same pool
-        # as cell-fitting rather than a second one: detection always runs
-        # after fitting completes within one frame, never concurrently with
-        # it, so there's no new oversubscription from sharing it.
-        futures = [state._executor.submit(_detect_candidate_blobs, smoothed, noise_lvl, tile,
-                                           state.known_cell_exclude_mask, state.detection)
-                   for tile in state.tiles]
+    if state._executor is not None and len(non_blank_tiles) > 1:
+        futures = [state._executor.submit(_detect_in_tile, crop, mask, tile, noise_lvl, state.detection)
+                   for tile, (crop, mask) in non_blank_tiles]
         for fut in futures:
             raw_candidates.extend(fut.result())
     else:
-        for tile in state.tiles:
-            raw_candidates.extend(
-                _detect_candidate_blobs(smoothed, noise_lvl, tile, state.known_cell_exclude_mask, state.detection))
+        for tile, (crop, mask) in non_blank_tiles:
+            raw_candidates.extend(_detect_in_tile(crop, mask, tile, noise_lvl, state.detection))
 
     _update_candidate_tracks(state, raw_candidates, residual, frame_index)
 

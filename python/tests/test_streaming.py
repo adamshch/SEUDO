@@ -255,6 +255,46 @@ def test_blanking_skips_expensive_detection_for_empty_tiles(monkeypatch):
     assert calls == [], 'ndimage.label should never be reached for an all-background frame'
 
 
+def test_single_active_tile_never_reaches_the_executor(monkeypatch):
+    # the sparse-activity regression this split was built to fix: with only
+    # one tile ever non-blank, detection should never touch the thread pool
+    # at all -- not "submit it and let it be fast," genuinely never call
+    # submit() for detection, since submission/sync overhead on an
+    # already-cheap tile is a net loss (see commit history/memory notes)
+    y, x, f = 120, 120, 10
+    # cell centered well inside one tile's core (>overlap px from every edge
+    # of its own tile), so its signal can never leak into a neighboring
+    # tile's halo -- see build_tiles: tile_shape=60/overlap=15 gives tile 0
+    # core (0,59,0,59), and (30,30) is 30px from the nearest edge
+    prof = gaussian_patch((y, x), center=(30, 30), sigma=2.0)
+    prof[prof < 0.05 * prof.max()] = 0.0
+
+    rng = np.random.default_rng(6)
+    movie = np.zeros((y, x, f))
+    for ff in range(f):
+        movie[:, :, ff] = prof * 3.0 + 0.01 * rng.normal(size=(y, x))
+
+    fit = FitParams(**{**vars(default_streaming_fit()), 'n_jobs': 4})
+    tiling = TilingConfig(tile_shape=(60, 60), overlap=15)  # 2x2 = 4 tiles, only tile 0 ever near the cell
+    state = StreamingState((y, x), tiling=tiling, fit=fit)  # no known cells -- isolates detection submissions
+
+    submit_calls = []
+    orig_submit = state._executor.submit
+
+    def spy_submit(*args, **kwargs):
+        submit_calls.append(args[0])  # the submitted function
+        return orig_submit(*args, **kwargs)
+
+    monkeypatch.setattr(state._executor, 'submit', spy_submit)
+
+    for ff in range(f):
+        realSEUDOfit(movie[:, :, ff], state)
+    state.close()
+
+    detect_submissions = [c for c in submit_calls if c.__name__ == '_detect_in_tile']
+    assert detect_submissions == [], 'a single non-blank tile should never be submitted to the executor'
+
+
 def make_multi_cell_movie(seed=4, n_cells=6, y=40, x=80, f=30):
     rng = np.random.default_rng(seed)
     xs = np.linspace(10, x - 10, n_cells)
