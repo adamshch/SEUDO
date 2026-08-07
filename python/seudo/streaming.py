@@ -688,10 +688,22 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     # _subtract_tracked_contributions. Only what's left (R2) gets scanned
     # for brand-new candidates, so an already-tracked candidate's own
     # residual (already accounted for above) can never spawn a duplicate.
-    residual2, candidate_exclude_mask = _subtract_tracked_contributions(state, residual)
-    combined_exclude_mask = state.known_cell_exclude_mask | candidate_exclude_mask
-    smoothed2 = convolve2d(residual2, state.one_blob, mode='same')
-    raw_candidates_new = _run_tile_detection(state, smoothed2, noise_map, combined_exclude_mask)
+    #
+    # With no active tracks, R2 is bit-identical to R1 (nothing to
+    # subtract) and the exclude mask is bit-identical to known_cell_exclude_
+    # mask alone (candidate_exclude_mask would be empty) -- so a second
+    # detection pass would just recompute exactly what the first pass
+    # already found. Skip it and reuse raw_candidates directly: most frames
+    # in a real run have zero in-progress candidates (promotion only takes
+    # a handful of frames), so this avoids a redundant convolution + full
+    # tile scan on the common case, not an approximation.
+    if state.candidate_tracks:
+        residual2, candidate_exclude_mask = _subtract_tracked_contributions(state, residual)
+        combined_exclude_mask = state.known_cell_exclude_mask | candidate_exclude_mask
+        smoothed2 = convolve2d(residual2, state.one_blob, mode='same')
+        raw_candidates_new = _run_tile_detection(state, smoothed2, noise_map, combined_exclude_mask)
+    else:
+        raw_candidates_new = raw_candidates
     _start_candidate_tracks(state, raw_candidates_new, residual, frame_index)
 
     new_cells = []
