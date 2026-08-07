@@ -527,3 +527,86 @@ def test_tracked_candidate_never_spawns_a_duplicate_track():
 
     assert state._next_track_id == 1, (
         f'expected exactly one track ever created for the single new cell, got {state._next_track_id}')
+
+
+def test_ds_time_default_is_a_noop():
+    # ds_time=1 (the default) must apply no averaging at all -- sigma2_ds
+    # equals the raw sigma2 exactly, and a single call's avg_frame equals
+    # the input frame exactly (np.mean of one array introduces no
+    # floating-point change), so behavior is bit-identical to every test
+    # above that never mentions ds_time at all.
+    y, x = 20, 20
+    fit = FitParams(sigma2=0.02)
+    state = StreamingState((y, x), fit=fit)
+    assert state.sigma2_ds == fit.sigma2
+
+    frame = np.random.default_rng(0).normal(size=(y, x))
+    state._frame_buffer.append(frame)
+    avg_frame = np.mean(state._frame_buffer, axis=0)
+    np.testing.assert_array_equal(avg_frame, frame)
+
+
+def test_ds_time_smooths_a_stepped_activity_trace():
+    # a single known cell with a noise-free step in true activity -- with
+    # ds_time=3, the FIRST frame after the step should read back as a
+    # partial (averaged-with-the-past) value, not the new true value
+    # immediately, and should reach the new true value only once the
+    # trailing window has fully slid past the step -- direct evidence the
+    # averaging math is doing the right causal thing, not just "some
+    # smoothing happens somewhere."
+    y, x, f = 30, 30, 20
+    prof = gaussian_patch((y, x), center=(15, 15), sigma=2.0)
+    prof[prof < 0.05 * prof.max()] = 0.0
+
+    act = np.full(f, 2.0)
+    step_at = 10
+    act[step_at:] = 8.0
+
+    movie = np.stack([prof * act[ff] for ff in range(f)], axis=2)
+
+    fit = FitParams(**{**vars(default_streaming_fit()), 'ds_time': 3})
+    state = StreamingState((y, x), initial_profiles=prof[:, :, np.newaxis], fit=fit)
+    activity = [realSEUDOfit(movie[:, :, ff], state).activity[0] for ff in range(f)]
+
+    # before the step: steady at the true value
+    assert np.allclose(activity[step_at - 1], 2.0, atol=1e-6)
+    # right at the step: averages 1 new frame at 8.0 with 2 trailing frames at 2.0
+    assert np.allclose(activity[step_at], (8.0 + 2.0 + 2.0) / 3.0, atol=1e-6)
+    # one frame later: 2 frames at 8.0, 1 trailing frame at 2.0
+    assert np.allclose(activity[step_at + 1], (8.0 + 8.0 + 2.0) / 3.0, atol=1e-6)
+    # once the window has fully slid past the step: back to steady, at the new value
+    assert np.allclose(activity[step_at + 2], 8.0, atol=1e-6)
+    assert np.allclose(activity[-1], 8.0, atol=1e-6)
+
+
+def test_ds_time_improves_detection_in_high_noise():
+    # a modest-amplitude cell under noise high enough to make single-frame
+    # detection unreliable -- ds_time=3's trailing average should reduce
+    # the effective per-pixel noise and detect it, while ds_time=1 (no
+    # averaging) fails to promote at all within the same frame budget
+    y, x, f = 30, 30, 100
+    prof = gaussian_patch((y, x), center=(15, 15), sigma=2.0)
+    prof[prof < 0.05 * prof.max()] = 0.0
+
+    rng = np.random.default_rng(7)
+    act = np.zeros(f)
+    act[10:] = 1.0
+
+    frames = [prof * act[ff] + 0.3 * rng.normal(size=(y, x)) for ff in range(f)]
+
+    def run(ds_time):
+        fit = FitParams(**{**vars(default_streaming_fit()), 'ds_time': ds_time})
+        state = StreamingState((y, x), fit=fit)
+        promoted_at = None
+        for ff in range(f):
+            r = realSEUDOfit(frames[ff], state)
+            if r.new_cells:
+                promoted_at = ff
+        return promoted_at, state.profiles.shape[2]
+
+    no_avg_promoted, no_avg_n = run(1)
+    smoothed_promoted, smoothed_n = run(3)
+
+    assert smoothed_n == 1, 'ds_time=3 should reliably detect the modest cell under high noise'
+    assert no_avg_n == 0 or (no_avg_promoted is not None and smoothed_promoted < no_avg_promoted), (
+        'ds_time=3 should detect the cell either faster than ds_time=1, or where ds_time=1 fails entirely')

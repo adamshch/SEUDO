@@ -27,9 +27,16 @@ fit against R1 with a real second SEUDO solve and subtracted out
 (_subtract_tracked_contributions) to build R2, and only R2 -- genuinely
 unexplained by both known cells and tracked candidates -- gets scanned for
 brand-new ones (_start_candidate_tracks).
+
+FitParams.ds_time (default 1, off) adds a small, bounded, strictly CAUSAL
+trailing moving average over the last ds_time frames before anything else
+happens -- distinct from realSEUDO's avg_frames (a forward-looking lookahead
+buffer, still deliberately not used here) since it never touches a frame
+that hasn't arrived yet.
 """
 
 import math
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -120,9 +127,32 @@ class PromotionParams:
 
 @dataclass
 class FitParams:
-    """Same knobs as estimate_time_courses_with_seudo -- no ds_time here,
-    since streaming is strictly causal with no frame-averaging buffer
-    (equivalent to ds_time=1).
+    """Same knobs as estimate_time_courses_with_seudo.
+
+    ds_time: width of a CAUSAL trailing moving average applied to incoming
+    frames before anything else touches them (fitting, residual, detection)
+    -- same purpose and same name as estimate_time_courses_with_seudo's own
+    ds_time, but computed differently: the offline solver's ds_time window
+    can be centered/whole-movie since it has the entire movie in hand,
+    while streaming only ever has the current frame and what came before,
+    so this averages the current frame with the (ds_time-1) preceding ones
+    (a plain deque, growing to full width over the first ds_time-1 calls --
+    never NaN-padded, since there's nothing to look ahead into). This is
+    NOT realSEUDO's avg_frames (a forward-looking lookahead buffer, ruled
+    out early in this module's design for breaking causality) -- it only
+    ever reduces per-pixel noise using frames already seen, at the cost of
+    a small, bounded (ds_time-1)-frame lag before the average fully reflects
+    a fresh transient. ds_time=1 (default) applies no averaging at all
+    (bit-identical to every behavior before this parameter existed -- np.mean
+    of a single frame is that frame exactly, since dividing by 1.0 introduces
+    no floating-point error).
+
+    Matches the offline solver's sigma2 scaling too: StreamingState computes
+    sigma2_ds = sigma2 / ds_time (see estimate_time_courses_with_seudo's own
+    `sigma2_ds = sigma2 / ds_time`) and uses it everywhere a cell's own setup
+    is built, since averaging ds_time frames reduces per-pixel noise variance
+    by roughly that same factor, and the FISTA lambda calibration assumes
+    sigma2 reflects the actual noise level of what it's being fit against.
 
     n_jobs: number of known cells to fit concurrently within a single frame,
     in a ThreadPoolExecutor (same lever, same rationale, as
@@ -161,6 +191,7 @@ class FitParams:
     native_nthreads: int = 1
     blob_spacing: float = 3.0
     n_jobs: int = 1
+    ds_time: int = 1
 
 
 @dataclass
@@ -247,6 +278,8 @@ class StreamingState:
             )
 
         self.one_blob = make_seudo_blob(self.fit.blob_radius)
+        self.sigma2_ds = self.fit.sigma2 / max(1, self.fit.ds_time)
+        self._frame_buffer = deque(maxlen=max(1, self.fit.ds_time))
         self.frame_index = 0
         self.first_detected_frame = {}
         self._cell_setups = {}
@@ -289,7 +322,7 @@ class StreamingState:
 def _add_cell_setup(state, cell_id, y0, y1, x0, x1):
     setup = _setup_cell_window(
         state.profiles, cell_id, y0, y1, x0, x1, state.fit.min_pix_for_inclusion,
-        state.fit.lambda_prof, state.fit.lambda_blob, state.fit.sigma2, state.fit.p, state.one_blob,
+        state.fit.lambda_prof, state.fit.lambda_blob, state.sigma2_ds, state.fit.p, state.one_blob,
     )
     setup['y0'], setup['y1'], setup['x0'], setup['x1'] = y0, y1, x0, x1
     state._cell_setups[cell_id] = setup
@@ -314,11 +347,29 @@ def _update_known_cell_exclude_mask(state, cell_id, y0, y1, x0, x1):
     state.known_cell_exclude_mask[y0:y1 + 1, x0:x1 + 1] |= footprint
 
 
-def _estimate_noise_level(residual):
-    return float(np.median(residual) - np.min(residual))
+def _estimate_noise_level(residual, scale):
+    """median-minus-min, floored at a scale-relative machine-epsilon level.
+    `scale` should be the magnitude of the actual DATA being fit (e.g.
+    avg_frame's own max abs value), not the residual's own -- a residual
+    that's already near-perfectly explained (e.g. a known cell whose
+    profile exactly spans what's left to fit, with nothing genuinely
+    unmodeled) is itself already down at the rounding-error level, so
+    flooring relative to its OWN magnitude would be circular and not
+    actually raise the floor above the error it's meant to catch. Without
+    this floor, cutoff_multiplier * ~0 is a threshold pure floating-point
+    round-off can spuriously cross, triggering a "detection" of numerical
+    noise as a real candidate (confirmed: this produced a degenerate
+    near-zero-amplitude candidate profile whose zero-norm column later
+    crashed the solver in _subtract_tracked_contributions). The 100x
+    safety factor covers realistic multi-ULP accumulation through a
+    np.linalg.solve, while staying astronomically below any real dataset's
+    actual noise floor -- a genuine no-op in practice."""
+    level = float(np.median(residual) - np.min(residual))
+    eps_floor = 100 * np.finfo(residual.dtype).eps * scale
+    return max(level, eps_floor)
 
 
-def _estimate_noise_map(residual, grid_shape):
+def _estimate_noise_map(residual, grid_shape, scale):
     """Spatially-varying noise floor: split the frame into a coarse
     grid_shape=(n_sections_y, n_sections_x) grid, estimate the noise level
     locally in each section (same median-minus-min heuristic as
@@ -327,12 +378,12 @@ def _estimate_noise_map(residual, grid_shape):
     full-resolution map -- smooth, not blocky, and avoids one region's
     unusual background skewing detection everywhere else. grid_shape=(1,1)
     (the default) collapses to the old single-scalar behavior exactly,
-    broadcast to the frame's shape."""
+    broadcast to the frame's shape. scale: see _estimate_noise_level."""
     mov_y, mov_x = residual.shape
     n_y, n_x = grid_shape
 
     if n_y == 1 and n_x == 1:
-        return np.full((mov_y, mov_x), _estimate_noise_level(residual))
+        return np.full((mov_y, mov_x), _estimate_noise_level(residual, scale))
 
     y_edges = np.linspace(0, mov_y, n_y + 1).astype(int)
     x_edges = np.linspace(0, mov_x, n_x + 1).astype(int)
@@ -343,7 +394,7 @@ def _estimate_noise_map(residual, grid_shape):
     for i in range(n_y):
         for j in range(n_x):
             section = residual[y_edges[i]:y_edges[i + 1], x_edges[j]:x_edges[j + 1]]
-            coarse[i, j] = _estimate_noise_level(section)
+            coarse[i, j] = _estimate_noise_level(section, scale)
 
     interp = RegularGridInterpolator((y_centers, x_centers), coarse, method='linear',
                                       bounds_error=False, fill_value=None)
@@ -530,7 +581,7 @@ def _subtract_tracked_contributions(state, residual):
 
         setup = _setup_cell_window(
             profile[:, :, np.newaxis], 0, y0, y1, x0, x1, state.fit.min_pix_for_inclusion,
-            state.fit.lambda_prof, state.fit.lambda_blob, state.fit.sigma2, state.fit.p, state.one_blob,
+            state.fit.lambda_prof, state.fit.lambda_blob, state.sigma2_ds, state.fit.p, state.one_blob,
         )
         this_residual = residual[y0:y1 + 1, x0:x1 + 1].ravel()
         _tc_lsq, fit_fancy, _fit_x, _lsq_cost, _bob_cost = _solve_one_frame_cell(
@@ -658,6 +709,12 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     if frame.shape != (state.mov_y, state.mov_x):
         raise ValueError(f'frame shape {frame.shape} does not match state shape {(state.mov_y, state.mov_x)}')
 
+    # causal trailing moving average over the last up-to-ds_time frames
+    # (this one included) -- see FitParams.ds_time. Everything below fits
+    # against avg_frame, never the single raw frame, once ds_time > 1.
+    state._frame_buffer.append(frame)
+    avg_frame = np.mean(state._frame_buffer, axis=0)
+
     activity = {}
     reconstruction = np.zeros((state.mov_y, state.mov_x), dtype=float)
 
@@ -668,10 +725,10 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
         # safe to run concurrently; the native solver releases the GIL for
         # its whole call, so this gets real multi-core speedup even though
         # these are Python threads, not processes
-        futures = {state._executor.submit(_fit_cell, state, frame, cell_id): cell_id for cell_id in cell_ids}
+        futures = {state._executor.submit(_fit_cell, state, avg_frame, cell_id): cell_id for cell_id in cell_ids}
         fit_results = {futures[fut]: fut.result() for fut in futures}
     else:
-        fit_results = {cell_id: _fit_cell(state, frame, cell_id) for cell_id in cell_ids}
+        fit_results = {cell_id: _fit_cell(state, avg_frame, cell_id) for cell_id in cell_ids}
 
     # accumulate into the shared reconstruction sequentially, in this
     # thread, after every fit has returned -- cells' windows can overlap in
@@ -680,8 +737,9 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
         activity[cell_id] = value
         reconstruction[y0:y1 + 1, x0:x1 + 1] += state.profiles[y0:y1 + 1, x0:x1 + 1, cell_id] * value
 
-    residual = frame - reconstruction
-    noise_map = _estimate_noise_map(residual, state.detection.noise_grid_shape)
+    residual = avg_frame - reconstruction
+    noise_scale = float(np.max(np.abs(avg_frame)))
+    noise_map = _estimate_noise_map(residual, state.detection.noise_grid_shape, noise_scale)
 
     # detect on R1 (raw residual after known-cell fitting) and advance every
     # existing track by centroid-matching against it -- unchanged from
@@ -719,7 +777,7 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     for track_id in ready:
         track = state.candidate_tracks.pop(track_id)
         new_id = _promote_candidate(state, track, frame_index)
-        value, _bbox = _fit_cell(state, frame, new_id)
+        value, _bbox = _fit_cell(state, avg_frame, new_id)
         activity[new_id] = value
         new_cells.append(new_id)
 
