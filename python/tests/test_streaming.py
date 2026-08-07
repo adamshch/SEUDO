@@ -476,3 +476,54 @@ def test_spatially_varying_noise_detects_modest_cell_faster_in_quiet_region():
     assert split_promoted < global_promoted, (
         'spatially-varying noise estimation should detect the modest cell faster '
         'than a global scalar dragged up by the unrelated noisy region')
+
+
+def test_subtract_tracked_contributions_removes_tracked_signal():
+    # a single active (not-yet-promoted) candidate track whose accumulated
+    # history already captures a clean cell shape -- stage 1 of two-stage
+    # detection should recognize and remove most of its contribution from a
+    # fresh residual, not leave it untouched (a no-op would defeat the whole
+    # point: telling an already-tracked candidate's own signal apart from
+    # something genuinely new -- see _subtract_tracked_contributions).
+    from seudo.streaming import CandidateTrack, _subtract_tracked_contributions
+
+    y, x = 30, 30
+    prof = gaussian_patch((y, x), center=(15, 15), sigma=2.0)
+    prof[prof < 0.05 * prof.max()] = 0.0
+
+    state = StreamingState((y, x), fit=default_streaming_fit())
+    bbox = (10, 20, 10, 20)
+    crop = prof[bbox[0]:bbox[1] + 1, bbox[2]:bbox[3] + 1]
+    mask = crop > 0
+    history_crop = crop * 3.0
+    track = CandidateTrack(
+        centroid=(15.0, 15.0), consecutive_frames=3, gap=0,
+        history=[(0, bbox, mask, history_crop)] * 3,
+    )
+    state.candidate_tracks[0] = track
+
+    rng = np.random.default_rng(0)
+    residual = prof * 3.0 + 0.01 * rng.normal(size=(y, x))
+    residual2, exclude_mask = _subtract_tracked_contributions(state, residual)
+
+    footprint = prof > 0
+    assert np.abs(residual2[footprint]).sum() < 0.5 * np.abs(residual[footprint]).sum(), (
+        'stage 1 should explain away most of an already-tracked candidate\'s own signal')
+    assert exclude_mask[15, 15], 'the tracked footprint should be excluded from new-candidate scanning'
+
+
+def test_tracked_candidate_never_spawns_a_duplicate_track():
+    # while a real cell is being tracked (pre-promotion), the two-stage
+    # subtraction should keep explaining its own signal away every frame --
+    # if it didn't, leftover residual at the same location could spuriously
+    # trigger a second, duplicate track for the same physical source
+    onset = 30
+    movie, prof0, prof1, act0, act1 = make_two_cell_movie(onset=onset, f=onset + 15)
+    y, x, f = movie.shape
+
+    state = StreamingState((y, x), initial_profiles=prof0[:, :, np.newaxis], fit=default_streaming_fit())
+    for ff in range(f):
+        realSEUDOfit(movie[:, :, ff], state)
+
+    assert state._next_track_id == 1, (
+        f'expected exactly one track ever created for the single new cell, got {state._next_track_id}')

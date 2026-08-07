@@ -18,6 +18,15 @@ whole-movie-in-memory only).
 Reuses the offline solver's actual fitting internals directly rather than
 re-deriving the math: _setup_cell_window/_solve_one_frame_cell (estimate.py),
 make_seudo_blob (blob.py), compute_roi_coms (geometry.py).
+
+Candidate detection is two-stage, per the realSEUDO paper's design: raw
+blobs are first detected on R1 (the residual after known-cell fitting) and
+used to advance already-tracked candidates by centroid matching
+(_update_candidate_tracks); each active track's own evolving profile is then
+fit against R1 with a real second SEUDO solve and subtracted out
+(_subtract_tracked_contributions) to build R2, and only R2 -- genuinely
+unexplained by both known cells and tracked candidates -- gets scanned for
+brand-new ones (_start_candidate_tracks).
 """
 
 import math
@@ -412,7 +421,41 @@ def _detect_in_tile(crop, noise_crop, mask, tile, detection):
     return candidates
 
 
+def _run_tile_detection(state, smoothed, noise_map, exclude_mask):
+    """Shared phase-1/phase-2 tile scan (see _tile_threshold_mask /
+    _detect_in_tile): cheap sequential blanking check over every tile, then
+    dilate+label+filter -- in the thread pool when it's worth it -- only for
+    tiles found non-blank. Used twice per frame: once against R1 (to find
+    candidates for matching against existing tracks) and once against R2
+    (to find genuinely new ones) -- see realSEUDOfit."""
+    non_blank_tiles = []
+    for tile in state.tiles:
+        hit = _tile_threshold_mask(smoothed, noise_map, tile, exclude_mask, state.detection)
+        if hit is not None:
+            non_blank_tiles.append((tile, hit))
+
+    raw_candidates = []
+    if state._executor is not None and len(non_blank_tiles) > 1:
+        futures = [state._executor.submit(_detect_in_tile, crop, noise_crop, mask, tile, state.detection)
+                   for tile, (crop, noise_crop, mask) in non_blank_tiles]
+        for fut in futures:
+            raw_candidates.extend(fut.result())
+    else:
+        for tile, (crop, noise_crop, mask) in non_blank_tiles:
+            raw_candidates.extend(_detect_in_tile(crop, noise_crop, mask, tile, state.detection))
+
+    return raw_candidates
+
+
 def _update_candidate_tracks(state, raw_candidates, residual, frame_index):
+    """Match this frame's raw candidates (detected on R1, the residual after
+    known-cell fitting) against existing tracks by nearest centroid, and
+    advance (or drop) each track accordingly -- the same matching logic this
+    module has always used. Deliberately does NOT create new tracks for
+    unmatched raw candidates: see _start_candidate_tracks, which only ever
+    sees raw candidates detected on R2 (R1 with every active track's own
+    fitted contribution subtracted out -- see _subtract_tracked_contributions),
+    so a track already being followed here can never spawn a duplicate."""
     pairs = []
     for track_id, track in state.candidate_tracks.items():
         for raw_idx, cand in enumerate(raw_candidates):
@@ -448,9 +491,64 @@ def _update_candidate_tracks(state, raw_candidates, residual, frame_index):
                 del state.candidate_tracks[track_id]
             # else: gap tolerated -- consecutive_frames left untouched, not reset
 
-    for raw_idx, cand in enumerate(raw_candidates):
-        if raw_idx in assigned_raw:
-            continue
+
+def _subtract_tracked_contributions(state, residual):
+    """Two-stage candidate detection, stage 1: fit every currently-active
+    track's own evolving profile (built from its accumulated history via
+    _build_promoted_profile) against `residual` with a real second SEUDO
+    solve -- the same fitting machinery used for known cells, just scoped to
+    the track's own small window -- and subtract out whatever it explains.
+    This is the realSEUDO paper's two-stage design (fit known cells -> R1 ->
+    fit each tracked candidate's own profile against R1 -> R2 -> only R2
+    gets scanned for genuinely new blobs): it stops an already-tracked
+    candidate's own residual from being mistaken for a second, nearby,
+    genuinely-new one in the brand-new-candidate scan below
+    (_start_candidate_tracks), on top of (not instead of) the ordinary
+    centroid matching that keeps advancing each track's own progress (see
+    _update_candidate_tracks).
+
+    Returns (residual2, exclude_mask): exclude_mask is the union of every
+    active track's (dilated) footprint regardless of this frame's fitted
+    weight -- a track's own territory should never spawn a duplicate new
+    track even on a frame its regression fit happens to be weak."""
+    residual2 = residual.copy()
+    exclude_mask = np.zeros((state.mov_y, state.mov_x), dtype=bool)
+    r = state.detection.exclude_radius_known_cells
+    structure = np.ones((2 * r + 1, 2 * r + 1), dtype=bool) if r > 0 else None
+
+    for track in state.candidate_tracks.values():
+        profile, _history_bbox = _build_promoted_profile(track, (state.mov_y, state.mov_x))
+        y0, y1, x0, x1 = _cell_window_bounds(profile, state.fit.pad_space, state.mov_y, state.mov_x, state.fit.use_com)
+        footprint = profile[y0:y1 + 1, x0:x1 + 1] > 0
+
+        setup = _setup_cell_window(
+            profile[:, :, np.newaxis], 0, y0, y1, x0, x1, state.fit.min_pix_for_inclusion,
+            state.fit.lambda_prof, state.fit.lambda_blob, state.fit.sigma2, state.fit.p, state.one_blob,
+        )
+        this_residual = residual[y0:y1 + 1, x0:x1 + 1].ravel()
+        _tc_lsq, fit_fancy, _fit_x, _lsq_cost, _bob_cost = _solve_one_frame_cell(
+            this_residual, setup['rois'], setup['rois_scaled'], setup['lambdas'], setup['norm_factors'],
+            setup['k1'], setup['k2'], setup['n_y'], setup['n_x'], state.one_blob, setup['operators'],
+            state.use_native, state.fit.native_l_mode, state.fit.native_nthreads,
+            state.fit.solver_tol, state.fit.solver_max_iter, state.fit.blob_spacing,
+        )
+        weight = float(fit_fancy[setup['cell_index_within']])
+        if weight > 0:
+            residual2[y0:y1 + 1, x0:x1 + 1] -= profile[y0:y1 + 1, x0:x1 + 1] * weight
+
+        dilated = ndimage.binary_dilation(footprint, structure=structure) if structure is not None else footprint
+        exclude_mask[y0:y1 + 1, x0:x1 + 1] |= dilated
+
+    return residual2, exclude_mask
+
+
+def _start_candidate_tracks(state, raw_candidates, residual, frame_index):
+    """Stage 2: every raw candidate detected on residual2 (see
+    _subtract_tracked_contributions) already excludes every currently-active
+    track's footprint, so each one is by construction a genuinely new
+    candidate -- no matching against existing tracks needed, just start
+    tracking it."""
+    for cand in raw_candidates:
         track_id = state._next_track_id
         state._next_track_id += 1
         y0, y1, x0, x1 = cand.bbox
@@ -576,38 +674,25 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
         reconstruction[y0:y1 + 1, x0:x1 + 1] += state.profiles[y0:y1 + 1, x0:x1 + 1, cell_id] * value
 
     residual = frame - reconstruction
-    smoothed = convolve2d(residual, state.one_blob, mode='same')
     noise_map = _estimate_noise_map(residual, state.detection.noise_grid_shape)
 
-    # phase 1 (always sequential): the cheap crop+threshold+exclude check
-    # for every tile. A plain boolean comparison is fast enough that
-    # submitting it to the thread pool would cost more than it saves, and
-    # doing it here is what lets a blank tile skip the executor entirely
-    # rather than paying submission/sync overhead for work that turns out
-    # to be free -- see _tile_threshold_mask.
-    non_blank_tiles = []
-    for tile in state.tiles:
-        hit = _tile_threshold_mask(smoothed, noise_map, tile, state.known_cell_exclude_mask, state.detection)
-        if hit is not None:
-            non_blank_tiles.append((tile, hit))
-
-    # phase 2 (parallel when worthwhile): dilate + label + filter, only for
-    # tiles phase 1 found non-blank. Each only reads its own crop/mask (never
-    # mutates them), so this is safe to run concurrently. Reuses the same
-    # pool as cell-fitting rather than a second one: detection always runs
-    # after fitting completes within one frame, never concurrently with it,
-    # so there's no new oversubscription from sharing it.
-    raw_candidates = []
-    if state._executor is not None and len(non_blank_tiles) > 1:
-        futures = [state._executor.submit(_detect_in_tile, crop, noise_crop, mask, tile, state.detection)
-                   for tile, (crop, noise_crop, mask) in non_blank_tiles]
-        for fut in futures:
-            raw_candidates.extend(fut.result())
-    else:
-        for tile, (crop, noise_crop, mask) in non_blank_tiles:
-            raw_candidates.extend(_detect_in_tile(crop, noise_crop, mask, tile, state.detection))
-
+    # detect on R1 (raw residual after known-cell fitting) and advance every
+    # existing track by centroid-matching against it -- unchanged from
+    # before two-stage detection; see _update_candidate_tracks.
+    smoothed = convolve2d(residual, state.one_blob, mode='same')
+    raw_candidates = _run_tile_detection(state, smoothed, noise_map, state.known_cell_exclude_mask)
     _update_candidate_tracks(state, raw_candidates, residual, frame_index)
+
+    # two-stage detection: fit every currently-active track's own evolving
+    # profile against R1 and subtract out whatever it explains -- see
+    # _subtract_tracked_contributions. Only what's left (R2) gets scanned
+    # for brand-new candidates, so an already-tracked candidate's own
+    # residual (already accounted for above) can never spawn a duplicate.
+    residual2, candidate_exclude_mask = _subtract_tracked_contributions(state, residual)
+    combined_exclude_mask = state.known_cell_exclude_mask | candidate_exclude_mask
+    smoothed2 = convolve2d(residual2, state.one_blob, mode='same')
+    raw_candidates_new = _run_tile_detection(state, smoothed2, noise_map, combined_exclude_mask)
+    _start_candidate_tracks(state, raw_candidates_new, residual, frame_index)
 
     new_cells = []
     ready = [tid for tid, t in state.candidate_tracks.items()
