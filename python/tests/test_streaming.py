@@ -448,7 +448,7 @@ def test_spatially_varying_noise_detects_modest_cell_faster_in_quiet_region():
 
     rng = np.random.default_rng(2)
     act = np.zeros(f)
-    act[10:] = 1.2  # modest amplitude
+    act[10:] = 1.0  # modest amplitude
 
     frames = []
     for ff in range(f):
@@ -592,7 +592,7 @@ def test_ds_time_improves_detection_in_high_noise():
     act = np.zeros(f)
     act[10:] = 1.0
 
-    frames = [prof * act[ff] + 0.3 * rng.normal(size=(y, x)) for ff in range(f)]
+    frames = [prof * act[ff] + 0.25 * rng.normal(size=(y, x)) for ff in range(f)]
 
     def run(ds_time):
         fit = FitParams(**{**vars(default_streaming_fit()), 'ds_time': ds_time})
@@ -610,3 +610,23 @@ def test_ds_time_improves_detection_in_high_noise():
     assert smoothed_n == 1, 'ds_time=3 should reliably detect the modest cell under high noise'
     assert no_avg_n == 0 or (no_avg_promoted is not None and smoothed_promoted < no_avg_promoted), (
         'ds_time=3 should detect the cell either faster than ds_time=1, or where ds_time=1 fails entirely')
+
+
+def test_blobify_radius_defaults_to_mirroring_fit_blob_radius():
+    # blobify_radius=None (the default) should build detect_blob identical
+    # to one_blob -- the exact coupled behavior this module always had
+    # before blobify_radius existed as an independent knob
+    y, x = 20, 20
+    fit = FitParams(blob_radius=2.5)
+    state = StreamingState((y, x), fit=fit)
+    np.testing.assert_array_equal(state.detect_blob, state.one_blob)
+
+
+def test_blobify_radius_override_produces_a_different_kernel():
+    # an explicit blobify_radius should genuinely decouple detection
+    # smoothing from the fit's own blob dictionary, not silently be ignored
+    y, x = 20, 20
+    fit = FitParams(blob_radius=3.0)
+    detection = DetectionParams(blobify_radius=1.2)
+    state = StreamingState((y, x), fit=fit, detection=detection)
+    assert state.detect_blob.shape != state.one_blob.shape

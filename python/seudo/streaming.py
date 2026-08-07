@@ -95,6 +95,28 @@ class DetectionParams:
     available spec for its candidate detector, which was never implemented
     in that repo. This is fresh code, not a port.
 
+    min_avg_px default changed from -2.0 to -1.0 (2026-08-07) to match
+    rois_params.m's own default exactly (min_avg_px=-1) -- our earlier -2.0
+    was an invented value with no reference behind it, and (found by
+    directly comparing against rois_params.m) was needlessly twice as
+    strict as the reference's own choice for the same knob.
+
+    blobify_radius: Gaussian radius for the detection-smoothing convolution
+    applied to the residual before thresholding (see realSEUDOfit) --
+    intentionally a SEPARATE, independently-tunable knob from
+    FitParams.blob_radius (the FISTA fit's own blob-dictionary radius, a
+    different concern) -- rois_params.m keeps these distinct too
+    (blobify_rad=1.2 default vs. this dataset's own fit blobRadius=3 in
+    demo.m). Default None means "mirror fit.blob_radius" -- exactly the
+    coupled behavior this module always had, before this parameter existed.
+    Tried defaulting to rois_params.m's own literal value (1.2) instead,
+    but real-data benchmarking on THIS dataset's actual cell sizes found it
+    measurably WORSE (12 vs. 16 cells found in the same 3000-frame window)
+    -- rois_params.m's 1.2 default was presumably tuned for a differently
+    -sized dataset, not a universal constant, so it isn't safe to adopt
+    site-unseen. Still worth experimenting with per-dataset -- a real,
+    exposed lever -- just not assumed correct without checking.
+
     noise_grid_shape: (n_sections_y, n_sections_x) for spatially-varying
     noise estimation -- splits the frame into this many sections, estimates
     the noise floor locally in each, then smoothly interpolates between
@@ -108,9 +130,10 @@ class DetectionParams:
     cutoff_multiplier: float = 4.0
     mask_blur_rad: int = 1
     min_roi_size: int = 50
-    min_avg_px: float = -2.0  # <0: |min_avg_px| * local noise level; >=0: absolute threshold
+    min_avg_px: float = -1.0  # <0: |min_avg_px| * local noise level; >=0: absolute threshold
     exclude_radius_known_cells: int = 5
     noise_grid_shape: tuple = (1, 1)
+    blobify_radius: float = None
 
 
 @dataclass
@@ -278,6 +301,10 @@ class StreamingState:
             )
 
         self.one_blob = make_seudo_blob(self.fit.blob_radius)
+        blobify_radius = self.detection.blobify_radius
+        if blobify_radius is None:
+            blobify_radius = self.fit.blob_radius
+        self.detect_blob = make_seudo_blob(blobify_radius)
         self.sigma2_ds = self.fit.sigma2 / max(1, self.fit.ds_time)
         self._frame_buffer = deque(maxlen=max(1, self.fit.ds_time))
         self.frame_index = 0
@@ -744,7 +771,7 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     # detect on R1 (raw residual after known-cell fitting) and advance every
     # existing track by centroid-matching against it -- unchanged from
     # before two-stage detection; see _update_candidate_tracks.
-    smoothed = convolve2d(residual, state.one_blob, mode='same')
+    smoothed = convolve2d(residual, state.detect_blob, mode='same')
     raw_candidates = _run_tile_detection(state, smoothed, noise_map, state.known_cell_exclude_mask)
     _update_candidate_tracks(state, raw_candidates, residual, frame_index)
 
@@ -765,7 +792,7 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     if state.candidate_tracks:
         residual2, candidate_exclude_mask = _subtract_tracked_contributions(state, residual)
         combined_exclude_mask = state.known_cell_exclude_mask | candidate_exclude_mask
-        smoothed2 = convolve2d(residual2, state.one_blob, mode='same')
+        smoothed2 = convolve2d(residual2, state.detect_blob, mode='same')
         raw_candidates_new = _run_tile_detection(state, smoothed2, noise_map, combined_exclude_mask)
     else:
         raw_candidates_new = raw_candidates
