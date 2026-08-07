@@ -297,6 +297,14 @@ def _detect_candidate_blobs(smoothed, noise_lvl, tile, exclude_mask, detection):
     cutoff = detection.cutoff_multiplier * noise_lvl
     mask = (crop > cutoff) & ~excl
 
+    if not mask.any():
+        # "blanking": nothing in this tile could possibly pass threshold, so
+        # skip the more expensive dilate+label+per-component-filter passes
+        # entirely -- correctness-neutral (they'd find zero candidates too),
+        # purely a speedup for large FOVs where most tiles are background
+        # most of the time (per realSEUDO paper's own flagged future work)
+        return []
+
     if detection.mask_blur_rad > 0:
         r = detection.mask_blur_rad
         structure = np.ones((2 * r + 1, 2 * r + 1), dtype=bool)
@@ -506,9 +514,22 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     noise_lvl = _estimate_noise_level(residual)
 
     raw_candidates = []
-    for tile in state.tiles:
-        raw_candidates.extend(
-            _detect_candidate_blobs(smoothed, noise_lvl, tile, state.known_cell_exclude_mask, state.detection))
+    if state._executor is not None and len(state.tiles) > 1:
+        # each tile's detection pass only reads smoothed/exclude_mask (never
+        # mutates them -- numpy slicing/comparison/dilation all produce new
+        # arrays), so this is safe to run concurrently. Reuses the same pool
+        # as cell-fitting rather than a second one: detection always runs
+        # after fitting completes within one frame, never concurrently with
+        # it, so there's no new oversubscription from sharing it.
+        futures = [state._executor.submit(_detect_candidate_blobs, smoothed, noise_lvl, tile,
+                                           state.known_cell_exclude_mask, state.detection)
+                   for tile in state.tiles]
+        for fut in futures:
+            raw_candidates.extend(fut.result())
+    else:
+        for tile in state.tiles:
+            raw_candidates.extend(
+                _detect_candidate_blobs(smoothed, noise_lvl, tile, state.known_cell_exclude_mask, state.detection))
 
     _update_candidate_tracks(state, raw_candidates, residual, frame_index)
 

@@ -198,6 +198,63 @@ def test_tiling_vs_no_tiling_agreement():
     np.testing.assert_allclose(untiled_activity0, tiled_activity0, atol=1e-8)
 
 
+def test_parallel_tile_detection_matches_sequential():
+    # a cell centered exactly on a tile-grid corner exercises multiple
+    # tiles' detection genuinely (see test_tiling_boundary_no_double_detect_or_miss)
+    y, x, f = 40, 40, 60
+    prof = gaussian_patch((y, x), center=(20, 20), sigma=2.0)
+    prof[prof < 0.05 * prof.max()] = 0.0
+
+    rng = np.random.default_rng(3)
+    act = np.zeros(f)
+    act[10:] = 3.0
+    movie = np.zeros((y, x, f))
+    for ff in range(f):
+        movie[:, :, ff] = prof * act[ff] + 0.01 * rng.normal(size=(y, x))
+
+    tiling = TilingConfig(tile_shape=(20, 20), overlap=15)
+
+    def run(n_jobs):
+        fit = FitParams(**{**vars(default_streaming_fit()), 'n_jobs': n_jobs})
+        state = StreamingState((y, x), tiling=tiling, fit=fit)
+        promoted_at = None
+        for ff in range(f):
+            r = realSEUDOfit(movie[:, :, ff], state)
+            if r.new_cells:
+                promoted_at = ff
+        state.close()
+        return promoted_at, state.profiles.shape[2]
+
+    seq = run(1)
+    par = run(4)
+    assert seq == par
+
+
+def test_blanking_skips_expensive_detection_for_empty_tiles(monkeypatch):
+    # a tile with no signal at all should never reach ndimage.label --
+    # verifies the "blanking" pre-filter is actually exercised, not just
+    # present in the source with no effect
+    import seudo.streaming as streaming_mod
+
+    y, x, f = 40, 40, 15
+    movie = np.zeros((y, x, f))  # pure background, no cell anywhere
+
+    calls = []
+    orig_label = streaming_mod.ndimage.label
+
+    def spy_label(*args, **kwargs):
+        calls.append(1)
+        return orig_label(*args, **kwargs)
+
+    monkeypatch.setattr(streaming_mod.ndimage, 'label', spy_label)
+
+    state = StreamingState((y, x), fit=default_streaming_fit())
+    for ff in range(f):
+        realSEUDOfit(movie[:, :, ff], state)
+
+    assert calls == [], 'ndimage.label should never be reached for an all-background frame'
+
+
 def make_multi_cell_movie(seed=4, n_cells=6, y=40, x=80, f=30):
     rng = np.random.default_rng(seed)
     xs = np.linspace(10, x - 10, n_cells)
