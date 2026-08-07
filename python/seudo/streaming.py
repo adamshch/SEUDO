@@ -21,6 +21,7 @@ make_seudo_blob (blob.py), compute_roi_coms (geometry.py).
 """
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -98,7 +99,16 @@ class PromotionParams:
 class FitParams:
     """Same knobs as estimate_time_courses_with_seudo -- no ds_time here,
     since streaming is strictly causal with no frame-averaging buffer
-    (equivalent to ds_time=1)."""
+    (equivalent to ds_time=1).
+
+    n_jobs: number of known cells to fit concurrently within a single frame,
+    in a ThreadPoolExecutor (same lever, same rationale, as
+    estimate_time_courses_with_seudo's own n_jobs -- each cell's fit is
+    already fully independent, and the native solver releases the GIL for
+    its whole call, so real multi-core speedup happens even under Python
+    threads). n_jobs=1 (default) is sequential, bit-identical to n_jobs>1 --
+    only wall-clock time changes. Kept separate from native_nthreads (which
+    parallelizes *within* one cell's own solve) to avoid oversubscription."""
     p: float = 1e-5
     sigma2: float = 0.01
     lambda_blob: float = 20.0
@@ -112,6 +122,7 @@ class FitParams:
     use_native: object = 'auto'
     native_l_mode: int = 2
     native_nthreads: int = 1
+    n_jobs: int = 1
 
 
 @dataclass
@@ -213,6 +224,28 @@ class StreamingState:
                 self.profiles[:, :, cell_id], self.fit.pad_space, self.mov_y, self.mov_x, self.fit.use_com)
             _add_cell_setup(self, cell_id, y0, y1, x0, x1)
             _update_known_cell_exclude_mask(self, cell_id, y0, y1, x0, x1)
+
+        # created lazily, not per-frame -- pool spinup/teardown cost would
+        # otherwise repeat on every realSEUDOfit() call
+        self._executor = (
+            ThreadPoolExecutor(max_workers=self.fit.n_jobs) if self.fit.n_jobs and self.fit.n_jobs > 1 else None
+        )
+
+    def close(self):
+        """Shut down the per-cell fitting thread pool, if one was created
+        (fit.n_jobs > 1). Not required for correctness -- Python's own
+        atexit handling joins any live ThreadPoolExecutor at interpreter
+        exit -- but call it (or use StreamingState as a context manager)
+        to release the worker threads promptly in a long-lived process."""
+        if self._executor is not None:
+            self._executor.shutdown()
+            self._executor = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
 
 def _add_cell_setup(state, cell_id, y0, y1, x0, x1):
@@ -441,8 +474,22 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     activity = {}
     reconstruction = np.zeros((state.mov_y, state.mov_x), dtype=float)
 
-    for cell_id in list(state._cell_setups.keys()):
-        value, (y0, y1, x0, x1) = _fit_cell(state, frame, cell_id)
+    cell_ids = list(state._cell_setups.keys())
+    if state._executor is not None and len(cell_ids) > 1:
+        # each cell's fit is fully independent (own read-only setup, no
+        # shared mutable state -- see _fit_cell/_solve_one_frame_cell), so
+        # safe to run concurrently; the native solver releases the GIL for
+        # its whole call, so this gets real multi-core speedup even though
+        # these are Python threads, not processes
+        futures = {state._executor.submit(_fit_cell, state, frame, cell_id): cell_id for cell_id in cell_ids}
+        fit_results = {futures[fut]: fut.result() for fut in futures}
+    else:
+        fit_results = {cell_id: _fit_cell(state, frame, cell_id) for cell_id in cell_ids}
+
+    # accumulate into the shared reconstruction sequentially, in this
+    # thread, after every fit has returned -- cells' windows can overlap in
+    # pixel space, so concurrent += here would be a real data race
+    for cell_id, (value, (y0, y1, x0, x1)) in fit_results.items():
         activity[cell_id] = value
         reconstruction[y0:y1 + 1, x0:x1 + 1] += state.profiles[y0:y1 + 1, x0:x1 + 1, cell_id] * value
 

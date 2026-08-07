@@ -194,6 +194,57 @@ def test_tiling_vs_no_tiling_agreement():
     np.testing.assert_allclose(untiled_activity0, tiled_activity0, atol=1e-8)
 
 
+def make_multi_cell_movie(seed=4, n_cells=6, y=40, x=80, f=30):
+    rng = np.random.default_rng(seed)
+    xs = np.linspace(10, x - 10, n_cells)
+    profiles = np.zeros((y, x, n_cells))
+    for i, cx in enumerate(xs):
+        p = gaussian_patch((y, x), center=(y // 2, cx), sigma=2.0)
+        p[p < 0.05 * p.max()] = 0.0
+        profiles[:, :, i] = p
+
+    activity = rng.uniform(0.5, 4.0, size=(f, n_cells))
+    movie = np.zeros((y, x, f))
+    for ff in range(f):
+        frame = np.zeros((y, x))
+        for i in range(n_cells):
+            frame += profiles[:, :, i] * activity[ff, i]
+        movie[:, :, ff] = frame + 0.01 * rng.normal(size=(y, x))
+
+    return movie, profiles
+
+
+def test_n_jobs_gives_bit_identical_results_to_sequential():
+    movie, profiles = make_multi_cell_movie()
+    y, x, f = movie.shape
+
+    fit_seq = default_streaming_fit()
+    fit_par = FitParams(**{**vars(fit_seq), 'n_jobs': 4})
+
+    state_seq = StreamingState((y, x), initial_profiles=profiles, fit=fit_seq)
+    state_par = StreamingState((y, x), initial_profiles=profiles, fit=fit_par)
+    try:
+        for ff in range(f):
+            r_seq = realSEUDOfit(movie[:, :, ff], state_seq)
+            r_par = realSEUDOfit(movie[:, :, ff], state_par)
+            assert r_seq.activity.keys() == r_par.activity.keys()
+            for cell_id in r_seq.activity:
+                assert r_seq.activity[cell_id] == r_par.activity[cell_id]
+    finally:
+        state_par.close()
+
+
+def test_executor_lifecycle():
+    y, x = 20, 20
+    state_seq = StreamingState((y, x), fit=default_streaming_fit())
+    assert state_seq._executor is None  # n_jobs=1 -- no pool created
+
+    fit_par = FitParams(**{**vars(default_streaming_fit()), 'n_jobs': 4})
+    with StreamingState((y, x), fit=fit_par) as state_par:
+        assert state_par._executor is not None
+    assert state_par._executor is None  # closed on context-manager exit
+
+
 def test_state_contract_sanity():
     onset = 20
     movie, prof0, prof1, act0, act1 = make_two_cell_movie(onset=onset, f=40)
