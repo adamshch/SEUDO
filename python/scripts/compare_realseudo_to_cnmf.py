@@ -40,8 +40,10 @@ N_FRAMES = 8000    # how many frames of the movie to process; None = the whole m
 PROGRESS_EVERY = 200
 MATCH_MAX_DIST = 10.0  # px, centroid-distance cutoff for calling two ROIs "the same cell"
 
-# same demo.m-derived defaults used elsewhere in this project for this dataset
-SEUDO_PARAMS = dict(sigma2=0.0020, lambda_blob=10.0, blob_radius=3.0, pad_space=5, n_jobs=8)
+# same demo.m-derived defaults used elsewhere in this project for this dataset,
+# plus the best (n_jobs, native_nthreads) combo found by benchmark_native_nthreads.py
+SEUDO_PARAMS = dict(sigma2=0.0020, lambda_blob=10.0, blob_radius=3.0, pad_space=5,
+                     n_jobs=8, native_nthreads=4)
 
 
 def run_discovery(movie, n_frames):
