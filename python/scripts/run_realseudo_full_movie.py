@@ -31,11 +31,14 @@ N_FRAMES = None    # None = the whole movie
 PROGRESS_EVERY = 500
 
 # same demo.m-derived defaults used elsewhere in this project for this
-# dataset, plus the validated n_jobs/native_nthreads combo and the new
-# blob_spacing=3 default (FitParams no longer needs it passed explicitly,
-# but spelled out here for a self-documenting record of what this run used)
+# dataset, plus the validated n_jobs/native_nthreads combo, the blob_spacing=3
+# default, and ds_time=3 (a causal trailing 3-frame average, added to reduce
+# per-pixel noise -- see FitParams.ds_time's docstring). blob_spacing and
+# ds_time no longer need to be passed explicitly (both are FitParams
+# defaults now), but spelled out here for a self-documenting record of
+# what this run used.
 SEUDO_PARAMS = dict(sigma2=0.0020, lambda_blob=10.0, blob_radius=3.0, pad_space=5,
-                     n_jobs=8, native_nthreads=4, blob_spacing=3.0)
+                     n_jobs=8, native_nthreads=4, blob_spacing=3.0, ds_time=3)
 
 
 def run_discovery(movie, n_frames):
