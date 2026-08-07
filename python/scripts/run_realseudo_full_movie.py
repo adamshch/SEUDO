@@ -22,7 +22,7 @@ import numpy as np
 
 sys.path.insert(0, '.')
 from seudo.matlab_io import Hdf5Movie, load_profiles, load_time_courses  # noqa: E402
-from seudo.streaming import FitParams, StreamingState, realSEUDOfit  # noqa: E402
+from seudo.streaming import DetectionParams, FitParams, PromotionParams, StreamingState, realSEUDOfit  # noqa: E402
 
 DEMO_PATH = '../code/demoData1.mat'
 OUT_PATH = '../code/demoDataRealSEUDO.mat'
@@ -40,9 +40,26 @@ PROGRESS_EVERY = 500
 SEUDO_PARAMS = dict(sigma2=0.0020, lambda_blob=10.0, blob_radius=3.0, pad_space=5,
                      n_jobs=8, native_nthreads=4, blob_spacing=3.0, ds_time=3)
 
+# real-data one-at-a-time sweep (scripts/benchmark_detection_params.py) found
+# these three -- none with a reference value from the paper or rois_params.m,
+# unlike min_avg_px/blobify_radius -- measurably improve recall on a
+# 3000-frame window with no/minimal false-positive cost: exclude_radius=2
+# (was 5) finds cells packed closer to already-known ones; noise_grid_shape
+# =(2,2) (was (1,1)) adapts to spatial noise variation the same way already
+# validated on synthetic data; consecutive_frames_required=3 (was 5) is both
+# faster to promote AND more forgiving of a real cell that doesn't sustain
+# 5 straight causal hits. Combined: 20/21 matched vs. baseline's 16/16 in the
+# same window (one new false positive) -- still net better than any pairwise
+# subset of the three (see the benchmark script's combined-sweep follow-up).
+DETECTION_PARAMS = dict(exclude_radius_known_cells=2, noise_grid_shape=(2, 2))
+PROMOTION_PARAMS = dict(consecutive_frames_required=3)
+
 
 def run_discovery(movie, n_frames):
-    state = StreamingState(movie.shape[:2], fit=FitParams(**SEUDO_PARAMS))
+    state = StreamingState(
+        movie.shape[:2], fit=FitParams(**SEUDO_PARAMS),
+        detection=DetectionParams(**DETECTION_PARAMS), promotion=PromotionParams(**PROMOTION_PARAMS),
+    )
     activity_by_frame = []
 
     t0 = time.time()
