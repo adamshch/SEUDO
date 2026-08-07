@@ -9,7 +9,7 @@ import pytest
 from seudo._native import NATIVE_AVAILABLE
 from seudo.estimate import estimate_time_courses_with_seudo
 from seudo.geometry import compute_roi_coms
-from seudo.streaming import FitParams, StreamingState, TilingConfig, realSEUDOfit
+from seudo.streaming import DetectionParams, FitParams, StreamingState, TilingConfig, realSEUDOfit
 
 requires_native = pytest.mark.skipif(not NATIVE_AVAILABLE, reason='native extension not built')
 
@@ -412,3 +412,67 @@ def test_blob_spacing_is_a_noop_for_python_fallback():
     fine = run(1)
     coarse = run(4)
     np.testing.assert_array_equal(fine, coarse)
+
+
+def test_noise_grid_shape_default_matches_old_single_scalar_behavior():
+    # noise_grid_shape=(1,1) (the default) must reproduce the pre-existing
+    # single-global-scalar behavior exactly -- this is the backward
+    # compatibility guarantee for every earlier test in this file
+    onset = 20
+    movie, prof0, prof1, act0, act1 = make_two_cell_movie(onset=onset, f=40)
+    y, x, f = movie.shape
+
+    fit = default_streaming_fit()
+    default_detection = DetectionParams()
+    assert default_detection.noise_grid_shape == (1, 1)
+
+    state = StreamingState((y, x), initial_profiles=prof0[:, :, np.newaxis], fit=fit, detection=default_detection)
+    activity = [realSEUDOfit(movie[:, :, ff], state).activity[0] for ff in range(f)]
+
+    state_ref = StreamingState((y, x), initial_profiles=prof0[:, :, np.newaxis], fit=fit)
+    activity_ref = [realSEUDOfit(movie[:, :, ff], state_ref).activity[0] for ff in range(f)]
+
+    np.testing.assert_array_equal(activity, activity_ref)
+
+
+def test_spatially_varying_noise_detects_modest_cell_faster_in_quiet_region():
+    # a modest-amplitude cell in a quiet region, next to an unrelated noisy
+    # region -- a single global noise scalar gets dragged up by the noisy
+    # region, delaying detection of the modest cell; per-section estimation
+    # should detect it much faster since the quiet region's own noise floor
+    # is correctly low from the start
+    y, x, f = 60, 60, 30
+    yy, xx = np.mgrid[0:y, 0:x]
+    prof = gaussian_patch((y, x), center=(30, 15), sigma=2.0)  # in the quiet left half
+    prof[prof < 0.05 * prof.max()] = 0.0
+
+    rng = np.random.default_rng(2)
+    act = np.zeros(f)
+    act[10:] = 1.2  # modest amplitude
+
+    frames = []
+    for ff in range(f):
+        frame = prof * act[ff]
+        noise = np.zeros((y, x))
+        noise[:, :30] = 0.01 * rng.normal(size=(y, 30))       # quiet left half
+        noise[:, 30:] = 0.15 * rng.normal(size=(y, x - 30))   # noisy right half
+        frames.append(frame + noise)
+
+    def run(noise_grid_shape):
+        fit = default_streaming_fit()
+        detection = DetectionParams(noise_grid_shape=noise_grid_shape)
+        state = StreamingState((y, x), fit=fit, detection=detection)
+        promoted_at = None
+        for ff in range(f):
+            r = realSEUDOfit(frames[ff], state)
+            if r.new_cells:
+                promoted_at = ff
+        return promoted_at, state.profiles.shape[2]
+
+    global_promoted, global_n = run((1, 1))
+    split_promoted, split_n = run((1, 2))  # left/right halves get separate noise estimates
+
+    assert global_n == split_n == 1, 'both should eventually find the cell'
+    assert split_promoted < global_promoted, (
+        'spatially-varying noise estimation should detect the modest cell faster '
+        'than a global scalar dragged up by the unrelated noisy region')

@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from scipy import ndimage
+from scipy.interpolate import RegularGridInterpolator
 from scipy.signal import convolve2d
 
 from .blob import make_seudo_blob
@@ -76,12 +77,24 @@ class DetectionParams:
     """Field names/semantics mirror realSEUDO's rois_params.m knobs where
     sensible (min_roi_size, min_avg_px, mask_blur_rad) -- the closest
     available spec for its candidate detector, which was never implemented
-    in that repo. This is fresh code, not a port."""
+    in that repo. This is fresh code, not a port.
+
+    noise_grid_shape: (n_sections_y, n_sections_x) for spatially-varying
+    noise estimation -- splits the frame into this many sections, estimates
+    the noise floor locally in each, then smoothly interpolates between
+    section centers to build a full-resolution noise map, instead of one
+    global scalar. Guards against a single region with unusually high or
+    low background (uneven illumination, neuropil) skewing detection
+    everywhere else in the frame -- per the realSEUDO paper's own
+    noise-estimation approach ("kriging procedure or a cheap approximation
+    to a local median evaluated independently for each pixel"). Default
+    (1, 1) is exactly the old single-scalar behavior (bit-identical)."""
     cutoff_multiplier: float = 4.0
     mask_blur_rad: int = 1
     min_roi_size: int = 50
-    min_avg_px: float = -2.0  # <0: |min_avg_px| * noise_level; >=0: absolute threshold
+    min_avg_px: float = -2.0  # <0: |min_avg_px| * local noise level; >=0: absolute threshold
     exclude_radius_known_cells: int = 5
+    noise_grid_shape: tuple = (1, 1)
 
 
 @dataclass
@@ -289,7 +302,41 @@ def _estimate_noise_level(residual):
     return float(np.median(residual) - np.min(residual))
 
 
-def _tile_threshold_mask(smoothed, noise_lvl, tile, exclude_mask, detection):
+def _estimate_noise_map(residual, grid_shape):
+    """Spatially-varying noise floor: split the frame into a coarse
+    grid_shape=(n_sections_y, n_sections_x) grid, estimate the noise level
+    locally in each section (same median-minus-min heuristic as
+    _estimate_noise_level, just applied to a crop instead of the whole
+    frame), then linearly interpolate between section centers to build a
+    full-resolution map -- smooth, not blocky, and avoids one region's
+    unusual background skewing detection everywhere else. grid_shape=(1,1)
+    (the default) collapses to the old single-scalar behavior exactly,
+    broadcast to the frame's shape."""
+    mov_y, mov_x = residual.shape
+    n_y, n_x = grid_shape
+
+    if n_y == 1 and n_x == 1:
+        return np.full((mov_y, mov_x), _estimate_noise_level(residual))
+
+    y_edges = np.linspace(0, mov_y, n_y + 1).astype(int)
+    x_edges = np.linspace(0, mov_x, n_x + 1).astype(int)
+    y_centers = (y_edges[:-1] + y_edges[1:]) / 2.0
+    x_centers = (x_edges[:-1] + x_edges[1:]) / 2.0
+
+    coarse = np.empty((n_y, n_x))
+    for i in range(n_y):
+        for j in range(n_x):
+            section = residual[y_edges[i]:y_edges[i + 1], x_edges[j]:x_edges[j + 1]]
+            coarse[i, j] = _estimate_noise_level(section)
+
+    interp = RegularGridInterpolator((y_centers, x_centers), coarse, method='linear',
+                                      bounds_error=False, fill_value=None)
+    yy, xx = np.mgrid[0:mov_y, 0:mov_x]
+    points = np.stack([yy.ravel(), xx.ravel()], axis=-1)
+    return interp(points).reshape(mov_y, mov_x)
+
+
+def _tile_threshold_mask(smoothed, noise_map, tile, exclude_mask, detection):
     """The cheap part of tile detection: crop + threshold + exclude, nothing
     else. Meant to run sequentially over every tile before any thread-pool
     submission -- a plain boolean comparison is fast enough that doing it
@@ -297,21 +344,23 @@ def _tile_threshold_mask(smoothed, noise_lvl, tile, exclude_mask, detection):
     of farming it out, and it's what lets "blanking" (below) skip a tile
     without ever touching the executor at all.
 
-    Returns (crop, mask) if mask has any True pixel, else None ("blanking":
-    nothing here could possibly pass threshold, so the caller can skip this
-    tile completely -- correctness-neutral, since the expensive dilate+
-    label+filter passes below would find zero candidates here too)."""
+    Returns (crop, noise_crop, mask) if mask has any True pixel, else None
+    ("blanking": nothing here could possibly pass threshold, so the caller
+    can skip this tile completely -- correctness-neutral, since the
+    expensive dilate+label+filter passes below would find zero candidates
+    here too)."""
     hy0, hy1, hx0, hx1 = tile.halo
     crop = smoothed[hy0:hy1 + 1, hx0:hx1 + 1]
+    noise_crop = noise_map[hy0:hy1 + 1, hx0:hx1 + 1]
     excl = exclude_mask[hy0:hy1 + 1, hx0:hx1 + 1]
 
-    cutoff = detection.cutoff_multiplier * noise_lvl
+    cutoff = detection.cutoff_multiplier * noise_crop
     mask = (crop > cutoff) & ~excl
 
-    return (crop, mask) if mask.any() else None
+    return (crop, noise_crop, mask) if mask.any() else None
 
 
-def _detect_in_tile(crop, mask, tile, noise_lvl, detection):
+def _detect_in_tile(crop, noise_crop, mask, tile, detection):
     """The expensive part of tile detection: dilate + connected-component
     label + per-component size/brightness filtering. Only ever called for a
     tile _tile_threshold_mask already found non-blank -- this is the part
@@ -325,8 +374,6 @@ def _detect_in_tile(crop, mask, tile, noise_lvl, detection):
         mask = ndimage.binary_dilation(mask, structure=structure)
 
     labeled, n = ndimage.label(mask)
-    avg_thresh = (abs(detection.min_avg_px) * noise_lvl if detection.min_avg_px < 0
-                  else detection.min_avg_px)
 
     candidates = []
     for label_id in range(1, n + 1):
@@ -334,6 +381,11 @@ def _detect_in_tile(crop, mask, tile, noise_lvl, detection):
         size = int(comp_mask.sum())
         if size < detection.min_roi_size:
             continue
+        # local noise level for THIS component, not a single frame-wide
+        # scalar -- matters once noise_grid_shape makes noise_crop vary
+        local_noise = float(noise_crop[comp_mask].mean())
+        avg_thresh = (abs(detection.min_avg_px) * local_noise if detection.min_avg_px < 0
+                      else detection.min_avg_px)
         if float(crop[comp_mask].mean()) < avg_thresh:
             continue
 
@@ -525,7 +577,7 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
 
     residual = frame - reconstruction
     smoothed = convolve2d(residual, state.one_blob, mode='same')
-    noise_lvl = _estimate_noise_level(residual)
+    noise_map = _estimate_noise_map(residual, state.detection.noise_grid_shape)
 
     # phase 1 (always sequential): the cheap crop+threshold+exclude check
     # for every tile. A plain boolean comparison is fast enough that
@@ -535,7 +587,7 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     # to be free -- see _tile_threshold_mask.
     non_blank_tiles = []
     for tile in state.tiles:
-        hit = _tile_threshold_mask(smoothed, noise_lvl, tile, state.known_cell_exclude_mask, state.detection)
+        hit = _tile_threshold_mask(smoothed, noise_map, tile, state.known_cell_exclude_mask, state.detection)
         if hit is not None:
             non_blank_tiles.append((tile, hit))
 
@@ -547,13 +599,13 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     # so there's no new oversubscription from sharing it.
     raw_candidates = []
     if state._executor is not None and len(non_blank_tiles) > 1:
-        futures = [state._executor.submit(_detect_in_tile, crop, mask, tile, noise_lvl, state.detection)
-                   for tile, (crop, mask) in non_blank_tiles]
+        futures = [state._executor.submit(_detect_in_tile, crop, noise_crop, mask, tile, state.detection)
+                   for tile, (crop, noise_crop, mask) in non_blank_tiles]
         for fut in futures:
             raw_candidates.extend(fut.result())
     else:
-        for tile, (crop, mask) in non_blank_tiles:
-            raw_candidates.extend(_detect_in_tile(crop, mask, tile, noise_lvl, state.detection))
+        for tile, (crop, noise_crop, mask) in non_blank_tiles:
+            raw_candidates.extend(_detect_in_tile(crop, noise_crop, mask, tile, state.detection))
 
     _update_candidate_tracks(state, raw_candidates, residual, frame_index)
 
