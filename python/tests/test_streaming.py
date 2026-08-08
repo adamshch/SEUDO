@@ -781,3 +781,42 @@ def test_spatial_denoise_radius_changes_known_cell_activity_under_pixel_noise():
     denoised = run(1.5)
     assert not np.isclose(undenoised, denoised), (
         'spatial denoising should measurably change the fit when a sharp spike is present')
+
+
+def test_max_roi_extent_rejects_a_large_diffuse_region():
+    # a broad, roughly uniform elevated region (like a real illumination
+    # gradient, not a compact cell) spanning much of the frame -- without a
+    # cap this crosses threshold as one giant contiguous blob and gets
+    # tracked/promoted; max_roi_extent should reject it, while a normal-
+    # sized real cell elsewhere is unaffected. Note: the detected extent of
+    # even a compact real cell is inherently wider than its own true size,
+    # since detection thresholds the blob-convolved + dilated residual, not
+    # the raw cell -- the cap (35) is chosen comfortably above that
+    # inflated-but-real extent (~27px here at blob_radius=3), well below
+    # the gradient region's much larger one.
+    y, x, f = 120, 120, 10
+    gradient = np.zeros((y, x))
+    gradient[:60, :60] = 3.0
+
+    cell = gaussian_patch((y, x), center=(95, 95), sigma=2.0)
+    cell[cell < 0.05 * cell.max()] = 0.0
+
+    frames = [gradient + cell * 3.0 for _ in range(f)]
+    common = dict(sigma2=0.002, lambda_blob=10.0, blob_radius=3.0, pad_space=5, use_native=False)
+
+    def run(max_roi_extent):
+        fit = FitParams(**common)
+        detection = DetectionParams(max_roi_extent=max_roi_extent)
+        state = StreamingState((y, x), fit=fit, detection=detection)
+        max_tracks_ever = 0
+        for frame in frames:
+            realSEUDOfit(frame, state)
+            max_tracks_ever = max(max_tracks_ever, state._next_track_id)
+        return state.profiles.shape[2], max_tracks_ever
+
+    n_cells_uncapped, n_tracks_uncapped = run(None)
+    n_cells_capped, n_tracks_capped = run(35)
+
+    assert n_tracks_uncapped >= 2, 'sanity check: both the gradient region and the real cell get tracked uncapped'
+    assert n_cells_capped == 1, 'only the real cell should survive with the cap on'
+    assert n_cells_capped < n_cells_uncapped

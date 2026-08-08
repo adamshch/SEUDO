@@ -126,7 +126,28 @@ class DetectionParams:
     everywhere else in the frame -- per the realSEUDO paper's own
     noise-estimation approach ("kriging procedure or a cheap approximation
     to a local median evaluated independently for each pixel"). Default
-    (1, 1) is exactly the old single-scalar behavior (bit-identical)."""
+    (1, 1) is exactly the old single-scalar behavior (bit-identical).
+
+    max_roi_extent: reject a connected component whose bounding box's
+    longer side exceeds this many pixels -- a real cell has a physically
+    bounded size, but the raw-threshold-plus-connected-components detector
+    had no upper bound at all, only min_roi_size's lower one. Found via a
+    real bug: on the actual demo movie, a broad, genuine illumination
+    gradient (this dataset's top-left quadrant runs measurably brighter
+    than the rest, confirmed directly on the raw frames -- not a detection
+    bug, real data) forms ONE giant contiguous region crossing threshold,
+    gets accepted as a "candidate" purely because nothing ever checked its
+    size was cell-like, and (needing only a few consecutive causal hits)
+    gets permanently promoted into a huge, wrong-shaped "cell" -- visible
+    in scripts/plot_realseudo_vs_cnmf.py as a diffuse blob with no CNMF
+    counterpart. Extent (max bounding-box side), not pixel count, is the
+    discriminating measure: a real elongated cell can have a large pixel
+    count without being anomalous in any single dimension, while an
+    illumination-gradient region is large in both. Default None disables
+    the check entirely (matches every prior behavior); benchmark before
+    picking a cutoff for a new dataset -- this dataset's real cells
+    topped out around 31px, with a real gap before the ~39-47px
+    illumination-driven outliers, but that gap is dataset-specific."""
     cutoff_multiplier: float = 4.0
     mask_blur_rad: int = 1
     min_roi_size: int = 50
@@ -134,6 +155,7 @@ class DetectionParams:
     exclude_radius_known_cells: int = 5
     noise_grid_shape: tuple = (1, 1)
     blobify_radius: float = None
+    max_roi_extent: int = None
 
 
 @dataclass
@@ -497,6 +519,18 @@ def _detect_in_tile(crop, noise_crop, mask, tile, detection):
         size = int(comp_mask.sum())
         if size < detection.min_roi_size:
             continue
+
+        ys, xs = np.nonzero(comp_mask)
+        ly0, ly1, lx0, lx1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+
+        # reject anything physically too large to be a real cell -- see
+        # DetectionParams.max_roi_extent (extent, not pixel count: a real
+        # elongated cell can have a large pixel count without being
+        # anomalous in any single dimension, unlike e.g. a broad
+        # illumination-gradient region that's large in both).
+        if detection.max_roi_extent is not None and max(ly1 - ly0 + 1, lx1 - lx0 + 1) > detection.max_roi_extent:
+            continue
+
         # local noise level for THIS component, not a single frame-wide
         # scalar -- matters once noise_grid_shape makes noise_crop vary
         local_noise = float(noise_crop[comp_mask].mean())
@@ -505,7 +539,6 @@ def _detect_in_tile(crop, noise_crop, mask, tile, detection):
         if float(crop[comp_mask].mean()) < avg_thresh:
             continue
 
-        ys, xs = np.nonzero(comp_mask)
         centroid_global = (float(ys.mean()) + hy0, float(xs.mean()) + hx0)
 
         # keep only if the centroid's pixel falls in THIS tile's core --
@@ -519,7 +552,6 @@ def _detect_in_tile(crop, noise_crop, mask, tile, detection):
         if not (cy0 <= centroid_px[0] <= cy1 and cx0 <= centroid_px[1] <= cx1):
             continue
 
-        ly0, ly1, lx0, lx1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
         bbox_global = (ly0 + hy0, ly1 + hy0, lx0 + hx0, lx1 + hx0)
         local_mask = comp_mask[ly0:ly1 + 1, lx0:lx1 + 1]
 
