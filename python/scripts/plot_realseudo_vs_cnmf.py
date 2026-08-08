@@ -5,10 +5,12 @@ maps side by side, one neuron = one color, with corresponding (matched)
 neurons sharing the same color across both subplots, so agreement/disagreement
 is visible directly rather than having to cross-reference a table.
 
-Each pixel is colored by whichever cell has the highest peak-normalized
-profile value there (a clean "winner take all" segmentation, not alpha
-blending -- overlapping-cell pixels would otherwise muddy the color and
-defeat the point of a per-cell color key).
+Each pixel additively sums every cell's own color, weighted by that cell's
+peak-normalized profile value there -- so a cell's real spatial amplitude
+falloff stays visible (not flattened to one solid color per blob), and
+genuine overlap between two ROIs shows up directly as a blended/brighter
+color where their colors add, rather than one cell's color silently
+overwriting another's (as a "winner take all" argmax map would do).
 """
 
 import sys
@@ -45,25 +47,27 @@ def distinct_colors(n):
     return colors
 
 
-def segmentation_map(profiles, colors, threshold=0.05):
+def segmentation_map(profiles, colors, gain=1.0):
     """profiles: (Y, X, nCells). colors: list of nCells RGB tuples.
-    Returns an (Y, X, 3) image where each pixel takes the color of whichever
-    cell peaks highest there (peak-normalized per cell first, so a dim cell
-    isn't always shadowed by a brighter one), or BACKGROUND if no cell's
-    normalized value clears `threshold` at that pixel."""
+    Returns an (Y, X, 3) image built by additive blending: each cell's
+    profile is peak-normalized to 1 (so a dim cell isn't invisible next to
+    a bright one), then contributes color * normalized_value at every
+    pixel, summed across all cells on top of BACKGROUND, and finally
+    clipped to [0, 1]. A pixel with real overlap between two ROIs
+    therefore reads as their colors ADDING (visibly brighter/blended),
+    not one replacing the other -- and each ROI's own amplitude falloff
+    (peak vs. fringe) stays visible as a real intensity gradient instead
+    of a flat, uniformly-colored blob. `gain` scales the blend before
+    clipping, for turning up faint/small-amplitude ROIs if needed."""
     mov_y, mov_x, n_cells = profiles.shape
     peaks = profiles.max(axis=(0, 1), keepdims=True)
     peaks[peaks == 0] = 1.0
     normed = profiles / peaks
 
-    best_val = normed.max(axis=2)
-    best_idx = normed.argmax(axis=2)
-
-    img = np.full((mov_y, mov_x, 3), BACKGROUND, dtype=float)
-    color_arr = np.array(colors)
-    has_cell = best_val > threshold
-    img[has_cell] = color_arr[best_idx[has_cell]]
-    return img
+    color_arr = np.array(colors)  # (n_cells, 3)
+    img = np.tile(np.array(BACKGROUND), (mov_y, mov_x, 1))
+    img = img + gain * np.tensordot(normed, color_arr, axes=([2], [0]))
+    return np.clip(img, 0.0, 1.0)
 
 
 def main():
@@ -108,8 +112,8 @@ def main():
     axes[1].set_title(f'CNMF ground truth ({n_cnmf} cells, {n_matched} matched)')
     axes[1].axis('off')
 
-    fig.suptitle('Corresponding neurons share the same color between panels; '
-                  'unmatched neurons get their own unique color', y=0.99)
+    fig.suptitle('Corresponding neurons share the same color between panels (unmatched: own unique color); '
+                  'colors ADD where ROIs overlap, amplitude shown as intensity', y=0.99)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(OUT_PATH, dpi=150)
     print(f'saved comparison figure to {OUT_PATH}')
