@@ -957,6 +957,179 @@ def test_promote_candidate_merges_duplicate_instead_of_creating_new_cell():
     assert state.profiles.shape[2] == n_before, 'no duplicate profile should have been added'
 
 
+def test_try_stable_split_detects_an_intertwined_double_bump():
+    # Eq. 9 split half: two genuine, non-overlapping cells whose combined
+    # (uncorrected) profile makes one look like it's spatially contained
+    # inside the other, at comparable brightness -- the "intertwining of
+    # two cells" case the paper says should be split, not merged
+    from seudo.streaming import _try_stable_split
+
+    y, x = 30, 30
+    bump1 = gaussian_patch((y, x), center=(10, 10), sigma=2.0)
+    bump1[bump1 < 0.05 * bump1.max()] = 0.0
+    bump2 = gaussian_patch((y, x), center=(20, 20), sigma=2.0)
+    bump2[bump2 < 0.05 * bump2.max()] = 0.0
+    combined = bump1 + bump2
+    combined = combined / combined.max()
+
+    result = _try_stable_split(bump1, combined)
+    assert result is not None
+    inner, outer, beta = result
+    assert inner is bump1 and outer is combined
+    assert 0.5 < beta < 1.5, 'comparable brightness, not a weak partial activation'
+
+    # a symmetric shape (no real asymmetric containment) should not split
+    assert _try_stable_split(combined, combined) is None
+    # no overlap at all -- not a split candidate either
+    far = gaussian_patch((y, x), center=(2, 2), sigma=1.0)
+    far[far < 0.05 * far.max()] = 0.0
+    assert _try_stable_split(bump1, far) is None
+
+
+def test_try_stable_split_brightness_guard_prefers_merge_for_a_weak_partial_activation():
+    # the "smaller cross-section is ALSO weaker" case from the paper: a
+    # candidate whose own peak sits far below the existing cell's brightness
+    # in the shared region reads as a weak partial activation of the SAME
+    # cell, not a second cell to split out -- rois_params.m's
+    # subtract_far_max_brightness_ratio=2.0 default blocks this
+    from seudo.streaming import _eq9_containment_ratios, _try_stable_split
+
+    y, x = 30, 30
+    outer = np.zeros((y, x))
+    outer[8:18, 8:18] = 1.0  # broad, uniformly bright existing cell
+    inner = np.zeros((y, x))
+    inner[12, 12] = 1.0  # candidate's own sharp peak
+    # weak "shoulder" pixels: much dimmer than the existing cell is there
+    shoulder = [(r, c) for r in range(9, 17) for c in range(9, 17) if (r, c) != (12, 12)][:50]
+    for r, c in shoulder:
+        inner[r, c] = 0.05
+
+    rho_ab, rho_ba = _eq9_containment_ratios(inner, outer)
+    assert rho_ab >= 0.75 and rho_ba < 0.75, 'sanity check: this is the asymmetric-containment case'
+    assert _try_stable_split(inner, outer) is None
+
+
+def test_try_stable_split_symmetry_guard_rejects_a_borderline_asymmetric_case():
+    # asymmetric enough to clear k_stab on one side only (rho_ab=0.9,
+    # rho_ba=0.70 -- NOT a merge, both ratios high, since 0.70 < 0.75), but
+    # not asymmetric ENOUGH (rho_ba/rho_ab = 0.78 > 0.75) to trust as two
+    # genuinely distinct cells rather than noise around one boundary;
+    # rois_params.m's subtract_far_max_symmetry=0.75 default blocks this
+    from seudo.streaming import _eq9_containment_ratios, _try_stable_split
+
+    y, x = 30, 30
+    inner = np.zeros((y, x))
+    inner[0:10, 0:10] = 1.0            # 100px
+    outer = np.zeros((y, x))
+    outer[0:9, 0:10] = 1.0             # 90px overlap with inner
+    outer[10:13, 0:13] = 1.0           # 39px extra, non-overlapping with inner
+
+    rho_ab, rho_ba = _eq9_containment_ratios(inner, outer)
+    assert rho_ab >= 0.75 and rho_ba < 0.75, 'sanity check: this is the asymmetric-containment case'
+    assert rho_ba / rho_ab > 0.75, 'sanity check: not asymmetric enough to clear the symmetry guard'
+    assert _try_stable_split(inner, outer) is None
+
+
+def test_detect_residual_subregion_ignores_floating_point_crumbs():
+    # a bare `residual > 0` test is unsafe: subtracting beta*inner from
+    # outer rarely cancels to EXACTLY zero everywhere in inner's footprint,
+    # leaving ~1e-16-scale positive crumbs spanning that whole region --
+    # those crumbs must not out-compete the real leftover structure once
+    # dilated and connected-component-labeled
+    from seudo.streaming import _detect_residual_subregion
+
+    y, x = 30, 30
+    bump1 = gaussian_patch((y, x), center=(10, 10), sigma=2.0)
+    bump1[bump1 < 0.05 * bump1.max()] = 0.0
+    bump2 = gaussian_patch((y, x), center=(20, 20), sigma=2.0)
+    bump2[bump2 < 0.05 * bump2.max()] = 0.0
+    combined = bump1 + bump2
+    combined = combined / combined.max()
+
+    # a beta that's off from the "true" 1.0 by float rounding, same as a
+    # real _eq9_containment_ratios/_brightness_scale computation produces
+    beta = 0.9999999999999999
+    residual = np.clip(combined - beta * bump1, 0.0, None)
+
+    sub = _detect_residual_subregion(residual, min_roi_size=50, mask_blur_rad=1)
+    assert sub is not None
+    ys, xs = np.nonzero(sub > 0)
+    assert abs(float(ys.mean()) - 20) < 1.0 and abs(float(xs.mean()) - 20) < 1.0, \
+        'should recover bump2, not a rounding-noise shell around bump1'
+
+
+def test_promote_candidate_splits_an_existing_cell_that_contains_the_new_one():
+    # existing cell 0 is actually an unresolved double bump (two real cells
+    # that got merged into one profile at some earlier, less-informed
+    # point); a candidate track matching just ONE of the two bumps should
+    # trigger an Eq. 9 split: the candidate is promoted as a new cell, and
+    # cell 0's profile is corrected in place to just the OTHER bump
+    from seudo.streaming import CandidateTrack, _promote_candidate
+
+    y, x = 30, 30
+    bump1 = gaussian_patch((y, x), center=(10, 10), sigma=2.0)
+    bump1[bump1 < 0.05 * bump1.max()] = 0.0
+    bump2 = gaussian_patch((y, x), center=(20, 20), sigma=2.0)
+    bump2[bump2 < 0.05 * bump2.max()] = 0.0
+    combined = bump1 + bump2
+    combined = combined / combined.max()
+
+    state = StreamingState((y, x), initial_profiles=combined[:, :, np.newaxis], fit=default_streaming_fit())
+    n_before = state.profiles.shape[2]
+
+    ys, xs = np.nonzero(bump1 > 0)
+    bbox = (int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max()))
+    crop = bump1[bbox[0]:bbox[1] + 1, bbox[2]:bbox[3] + 1]
+    mask = crop > 0
+    track = CandidateTrack(centroid=(10.0, 10.0), consecutive_frames=3, gap=0,
+                            history=[(0, bbox, mask, crop)] * 3)
+
+    cell_id, is_new = _promote_candidate(state, track, frame_index=0)
+    assert is_new is True
+    assert state.profiles.shape[2] == n_before + 1, 'exactly one new cell, not a duplicate double-bump'
+
+    coms, _bounds = compute_roi_coms(state.profiles)
+    new_com = coms[cell_id]
+    old_com = coms[0]
+    np.testing.assert_allclose(new_com, (10.0, 10.0), atol=1.0)
+    np.testing.assert_allclose(old_com, (20.0, 20.0), atol=1.0), 'cell 0 should now be just the OTHER bump'
+
+
+def test_promote_candidate_absorbs_an_existing_cell_contained_within_the_new_one():
+    # the reverse direction: the candidate track's own profile turns out to
+    # be a double bump that fully contains an already-known, smaller cell
+    # plus real extra structure -- the existing cell stays put, and the
+    # NEW cell promoted is the residual (the candidate's extra structure),
+    # not the candidate's raw (double-bump) profile
+    from seudo.streaming import CandidateTrack, _promote_candidate
+
+    y, x = 30, 30
+    bump1 = gaussian_patch((y, x), center=(10, 10), sigma=2.0)
+    bump1[bump1 < 0.05 * bump1.max()] = 0.0
+    bump2 = gaussian_patch((y, x), center=(20, 20), sigma=2.0)
+    bump2[bump2 < 0.05 * bump2.max()] = 0.0
+    combined = bump1 + bump2
+    combined = combined / combined.max()
+
+    state = StreamingState((y, x), initial_profiles=bump1[:, :, np.newaxis], fit=default_streaming_fit())
+    n_before = state.profiles.shape[2]
+
+    ys, xs = np.nonzero(combined > 0)
+    bbox = (int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max()))
+    crop = combined[bbox[0]:bbox[1] + 1, bbox[2]:bbox[3] + 1]
+    mask = crop > 0
+    track = CandidateTrack(centroid=(15.0, 15.0), consecutive_frames=3, gap=0,
+                            history=[(0, bbox, mask, crop)] * 3)
+
+    cell_id, is_new = _promote_candidate(state, track, frame_index=0)
+    assert is_new is True
+    assert state.profiles.shape[2] == n_before + 1
+
+    coms, _bounds = compute_roi_coms(state.profiles)
+    np.testing.assert_allclose(coms[0], (10.0, 10.0), atol=1.0), 'existing cell should be untouched'
+    np.testing.assert_allclose(coms[cell_id], (20.0, 20.0), atol=1.0), 'new cell should be the residual, not the raw double bump'
+
+
 def test_lookahead_frames_default_warns_and_returns_none_during_warmup():
     y, x = 20, 20
     with pytest.warns(UserWarning, match='lookahead buffer'):

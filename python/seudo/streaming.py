@@ -968,16 +968,185 @@ def _find_stable_merge_target(state, profile, k_stab=0.75):
     return None
 
 
+def _brightness_scale(inner, outer):
+    """Least-squares coefficient scaling `inner` to match `outer`,
+    restricted to their overlap -- the same quantity Eq. 9's beta uses, but
+    returned as a plain scale factor rather than a ratio-of-ratios, since
+    the split guards below need the raw brightness comparison, not rho."""
+    overlap = (inner > 0) & (outer > 0)
+    inner_ol = np.where(overlap, inner, 0.0)
+    denom = float(np.sum(inner_ol * inner_ol))
+    if denom == 0:
+        return 0.0
+    return float(np.sum(inner_ol * outer)) / denom
+
+
+def _try_stable_split(profile_a, profile_b, k_stab=0.75,
+                       max_brightness_ratio=2.0, max_symmetry=0.75):
+    """Eq. 9 split half (the merge half lives in _find_stable_merge_target
+    above): triggers when exactly ONE containment ratio clears k_stab -- one
+    profile fits well inside the other, but not vice versa -- meaning the
+    container likely holds real structure beyond the contained profile.
+    Paper sec 3.2: "if one cross-section is inside the other, look at
+    relative brightness: if the smaller cross-section is also weaker, it's
+    likely a weaker partial activation of the same cell and should be
+    merged, if the smaller cross-section has a close or higher brightness,
+    the larger cross-section likely represents an intertwining of two cells
+    that has to be split." Guard thresholds match rois_params.m's
+    subtract_far_max_brightness_ratio/subtract_far_max_symmetry defaults
+    (2.0/0.75) -- the MATLAB reference for this exact decision
+    (combine_rois.m's overlap_score_far).
+
+    Returns (inner, outer, beta) if a split condition holds -- inner is the
+    well-contained profile, outer is the one to decompose, beta is inner's
+    fitted brightness scale in the overlap (subtract beta*inner from outer
+    to isolate outer's extra structure). Returns None if this is actually a
+    merge case (both ratios high), genuinely separate (neither ratio high),
+    the container is just brighter (the contained profile reads as a weak
+    partial activation -- a merge, not a split), or not asymmetric enough to
+    trust as two real cells rather than noise."""
+    rho_ab, rho_ba = _eq9_containment_ratios(profile_a, profile_b)
+    if rho_ab >= k_stab and rho_ba >= k_stab:
+        return None
+    if rho_ab >= k_stab:
+        inner, outer, rho_strong, rho_weak = profile_a, profile_b, rho_ab, rho_ba
+    elif rho_ba >= k_stab:
+        inner, outer, rho_strong, rho_weak = profile_b, profile_a, rho_ba, rho_ab
+    else:
+        return None
+
+    beta = _brightness_scale(inner, outer)
+    if beta <= 0 or beta >= max_brightness_ratio:
+        return None
+    if rho_weak / rho_strong > max_symmetry:
+        return None
+
+    return inner, outer, beta
+
+
+def _detect_residual_subregion(residual, min_roi_size, mask_blur_rad, rel_threshold=0.01):
+    """Re-detects the largest surviving connected component of a residual
+    profile (already nonneg-clipped) after subtracting a well-contained
+    profile's fitted contribution from a larger one -- the split
+    counterpart of _build_promoted_profile. Unlike the frame-level detector
+    (_detect_in_tile), this runs directly on a stored, already-clean profile
+    rather than a noisy raw frame, so there's no per-pixel sensor-noise
+    level to threshold against -- but a bare `residual > 0` test is NOT
+    safe here: beta*inner rarely cancels outer down to EXACTLY zero
+    everywhere across inner's whole footprint (floating-point rounding
+    leaves ~1e-16-scale positive crumbs spanning that entire region), and
+    those crumbs can out-count-pixels the real leftover structure once
+    dilated, causing the wrong component to be picked. rel_threshold=0.01
+    (1% of the residual's own peak) matches this codebase's existing
+    peak-relative cleanup convention (e.g. make_seudo_blob's clip_height,
+    and this module's own tests' `< 0.05 * peak` pattern) and comfortably
+    clears rounding-level noise while keeping any real signal. Returns the
+    peak-renormalized profile of the largest component clearing
+    min_roi_size, or None if nothing does (the split found no real leftover
+    structure)."""
+    peak_in = residual.max()
+    if peak_in <= 0:
+        return None
+    mask = residual > rel_threshold * peak_in
+    if mask_blur_rad > 0:
+        r = mask_blur_rad
+        structure = np.ones((2 * r + 1, 2 * r + 1), dtype=bool)
+        mask = ndimage.binary_dilation(mask, structure=structure)
+
+    labeled, n = ndimage.label(mask)
+    if n == 0:
+        return None
+
+    sizes = ndimage.sum(np.ones_like(labeled), labeled, index=range(1, n + 1))
+    best_label = int(np.argmax(sizes)) + 1
+    if sizes[best_label - 1] < min_roi_size:
+        return None
+
+    out = np.where(labeled == best_label, residual, 0.0)
+    peak = out.max()
+    if peak <= 0:
+        return None
+    return out / peak
+
+
+def _split_stable_profile(state, profile_a, cell_id_b, k_stab=0.75):
+    """Attempts the Eq. 9 split at promotion time for one (candidate,
+    existing cell) pair. profile_a is the candidate about to be promoted;
+    cell_id_b is an existing Xstab cell. Returns None if no split condition
+    holds for this pair, else a (kind, residual_or_none) tuple:
+    - ('candidate_new', residual_or_none): the candidate is the
+      well-contained (inner) profile -- promote it as a new cell as usual;
+      if residual_or_none is not None, it replaces cell_id_b's profile in
+      place (cell_id_b's old shape apparently also contained extra
+      structure beyond the candidate).
+    - ('candidate_absorbed', residual_or_none): the EXISTING cell is the
+      well-contained (inner) profile -- the candidate apparently contains
+      the existing cell plus extra structure. cell_id_b is left unchanged
+      either way; if residual_or_none is not None, the caller should
+      promote IT (the candidate's extra structure) as the new cell instead
+      of the candidate's own raw profile. If residual_or_none is None, the
+      candidate has nothing left once the existing cell's contribution is
+      removed -- there's no new cell here, the same outcome as a merge."""
+    profile_b = state.profiles[:, :, cell_id_b]
+    result = _try_stable_split(profile_a, profile_b, k_stab=k_stab)
+    if result is None:
+        return None
+    inner, outer, beta = result
+
+    residual = np.clip(outer - beta * inner, 0.0, None)
+    sub_profile = _detect_residual_subregion(
+        residual, state.detection.min_roi_size, state.detection.mask_blur_rad)
+
+    if inner is profile_a:
+        return 'candidate_new', sub_profile
+    return 'candidate_absorbed', sub_profile
+
+
+def _replace_cell_profile(state, cell_id, new_profile):
+    """Overwrites an existing Xstab cell's profile in place (same cell_id,
+    so external time-course indexing stays stable) after an Eq. 9 split
+    determined its old shape actually contained extra structure beyond a
+    newly-promoted candidate. Rebuilds its cached fit window/setup the same
+    way a brand-new cell's is built, and re-invalidates any OTHER cell's
+    setup whose window now overlaps this one's new (smaller) bbox. The
+    exclude mask is only ever grown (|=), never shrunk, for this cell --
+    a shrinking cell leaves a few stale excluded pixels behind from its old,
+    larger footprint, which is a conservative, safe direction (slightly
+    under- rather than over-detects future candidates there), not an
+    incorrect one."""
+    state.profiles[:, :, cell_id] = new_profile
+    y0, y1, x0, x1 = _cell_window_bounds(new_profile, state.fit.pad_space, state.mov_y, state.mov_x, state.fit.use_com)
+    _add_cell_setup(state, cell_id, y0, y1, x0, x1)
+    _invalidate_overlapping_setups(state, cell_id, y0, y1, x0, x1)
+    _update_known_cell_exclude_mask(state, cell_id, y0, y1, x0, x1)
+
+
 def _promote_candidate(state, track, frame_index):
     """Returns (cell_id, is_new). is_new=False means the candidate was
-    merged into an already-known cell (Eq. 9) rather than added as a
-    duplicate -- the caller should not treat cell_id as a newly-promoted
-    cell in that case (it's already been fit and reported this frame)."""
+    merged into (Eq. 9 merge), or fully absorbed by (Eq. 9 split, nothing
+    left over once the existing cell's contribution is removed) an
+    already-known cell, rather than added as a duplicate -- the caller
+    should not treat cell_id as a newly-promoted cell in that case (it's
+    already been fit and reported this frame)."""
     profile, _bbox = _build_promoted_profile(track, (state.mov_y, state.mov_x))
 
     merge_target = _find_stable_merge_target(state, profile)
     if merge_target is not None:
         return merge_target, False
+
+    for cell_id in range(state.profiles.shape[2]):
+        split = _split_stable_profile(state, profile, cell_id)
+        if split is None:
+            continue
+        kind, sub_profile = split
+        if kind == 'candidate_absorbed':
+            if sub_profile is None:
+                return cell_id, False
+            profile = sub_profile
+        else:  # 'candidate_new'
+            if sub_profile is not None:
+                _replace_cell_profile(state, cell_id, sub_profile)
+        break
 
     new_id = state.profiles.shape[2]
     state.profiles = np.concatenate([state.profiles, profile[:, :, np.newaxis]], axis=2)
