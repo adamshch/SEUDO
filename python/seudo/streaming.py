@@ -177,10 +177,25 @@ class PromotionParams:
     realSEUDO's design (an avg_frames=5 forward-looking buffer *before* up
     to recent_frames=10 more frames of promotion latency) -- per user
     direction for causal, low-latency detection. max_track_gap=1 tolerates
-    one missed frame without resetting a track's progress."""
+    one missed frame without resetting a track's progress.
+
+    stability_frames: an ADDITIONAL promotion gate, off by default (0).
+    The paper's own Algorithm 1 (step 12) promotes a temp profile once it
+    has "not been updated in the last few frames" -- shape STABILITY, not
+    sustained ACTIVITY, which is what consecutive_frames_required alone
+    measures (a track can hit consecutive_frames_required while its
+    detected footprint is still growing frame to frame, e.g. a cell whose
+    signal is still ramping up and revealing more above-threshold pixels
+    each frame). When stability_frames > 0, a track additionally needs
+    this many consecutive matched frames whose detected bbox added
+    nothing new to its running union bbox before promoting -- i.e. its
+    shape has genuinely converged, not just been seen repeatedly. 0
+    (off) exactly reproduces the original consecutive-frames-only
+    behavior."""
     consecutive_frames_required: int = 5
     max_track_gap: int = 1
     match_max_centroid_dist: float = 5.0
+    stability_frames: int = 0
 
 
 @dataclass
@@ -312,6 +327,8 @@ class CandidateTrack:
     consecutive_frames: int
     gap: int
     history: list = field(default_factory=list)  # [(frame_index, bbox, mask, residual_crop), ...]
+    union_bbox: tuple = None    # running union of every matched frame's detected bbox so far
+    stable_frames: int = 0      # consecutive matched frames whose bbox added nothing new to union_bbox
 
 
 def _cell_window_bounds(prof, pad_space, mov_y, mov_x, use_com):
@@ -336,6 +353,18 @@ def _bbox_overlap(a, b):
     ay0, ay1, ax0, ax1 = a
     by0, by1, bx0, bx1 = b
     return ay0 <= by1 and by0 <= ay1 and ax0 <= bx1 and bx0 <= ax1
+
+
+def _bbox_contains(outer, inner):
+    oy0, oy1, ox0, ox1 = outer
+    iy0, iy1, ix0, ix1 = inner
+    return oy0 <= iy0 and iy1 <= oy1 and ox0 <= ix0 and ix1 <= ox1
+
+
+def _bbox_union(a, b):
+    ay0, ay1, ax0, ax1 = a
+    by0, by1, bx0, bx1 = b
+    return min(ay0, by0), max(ay1, by1), min(ax0, bx0), max(ax1, bx1)
 
 
 class StreamingState:
@@ -717,6 +746,16 @@ def _update_candidate_tracks(state, raw_candidates, residual, frame_index):
         if len(track.history) > cap:
             track.history.pop(0)
 
+        # PromotionParams.stability_frames' shape-stability signal (paper
+        # Algorithm 1 step 12): did this frame's detection add anything new
+        # to the track's own accumulated footprint, or is it already fully
+        # explained by what's been seen before?
+        if track.union_bbox is None or not _bbox_contains(track.union_bbox, cand.bbox):
+            track.union_bbox = cand.bbox if track.union_bbox is None else _bbox_union(track.union_bbox, cand.bbox)
+            track.stable_frames = 0
+        else:
+            track.stable_frames += 1
+
     for track_id in list(state.candidate_tracks.keys()):
         if track_id not in assigned_tracks:
             track = state.candidate_tracks[track_id]
@@ -863,6 +902,7 @@ def _start_candidate_tracks(state, raw_candidates, residual, frame_index, track_
         state.candidate_tracks[track_id] = CandidateTrack(
             centroid=cand.centroid, consecutive_frames=1, gap=0,
             history=[(frame_index, cand.bbox, cand.mask, residual[y0:y1 + 1, x0:x1 + 1])],
+            union_bbox=cand.bbox, stable_frames=0,
         )
 
 
@@ -1294,8 +1334,10 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
         _quarantine_rejected_regions(state, rejected_bboxes)
 
     new_cells = []
+    stability_req = state.promotion.stability_frames
     ready = [tid for tid, t in state.candidate_tracks.items()
-             if t.consecutive_frames >= state.promotion.consecutive_frames_required]
+             if t.consecutive_frames >= state.promotion.consecutive_frames_required
+             and (stability_req <= 0 or t.stable_frames >= stability_req)]
     for track_id in ready:
         track = state.candidate_tracks.pop(track_id)
         cell_id, is_new = _promote_candidate(state, track, frame_index)

@@ -1130,6 +1130,97 @@ def test_promote_candidate_absorbs_an_existing_cell_contained_within_the_new_one
     np.testing.assert_allclose(coms[cell_id], (20.0, 20.0), atol=1.0), 'new cell should be the residual, not the raw double bump'
 
 
+def test_bbox_contains_and_union():
+    from seudo.streaming import _bbox_contains, _bbox_union
+
+    outer = (0, 10, 0, 10)
+    inner = (2, 8, 2, 8)
+    assert _bbox_contains(outer, inner) is True
+    assert _bbox_contains(inner, outer) is False
+    assert _bbox_contains(outer, outer) is True  # a bbox contains itself
+
+    assert _bbox_union((0, 5, 0, 5), (3, 8, 2, 9)) == (0, 8, 0, 9)
+
+
+def test_stability_frames_tracks_footprint_growth_in_update_candidate_tracks():
+    # direct check of the PromotionParams.stability_frames bookkeeping,
+    # independent of the rest of the detection/promotion machinery: a
+    # track's stable_frames counter should reset to 0 whenever a matched
+    # frame's bbox adds anything new to the track's running union, and
+    # only climb once the same footprint keeps recurring
+    from seudo.streaming import CandidateTrack, RawCandidate, _update_candidate_tracks
+
+    y, x = 30, 30
+    state = StreamingState((y, x), fit=default_streaming_fit())
+    residual = np.zeros((y, x))
+
+    state.candidate_tracks[0] = CandidateTrack(
+        centroid=(15.0, 15.0), consecutive_frames=1, gap=0,
+        history=[(0, (14, 16, 14, 16), np.ones((3, 3), dtype=bool), np.ones((3, 3)))],
+        union_bbox=(14, 16, 14, 16), stable_frames=0,
+    )
+
+    # frame 2: bbox grows -- stable_frames stays at 0
+    growing_bbox = (13, 17, 13, 17)
+    cand = RawCandidate(centroid=(15.0, 15.0), bbox=growing_bbox, mask=np.ones((5, 5), dtype=bool))
+    _update_candidate_tracks(state, [cand], residual, frame_index=1)
+    assert state.candidate_tracks[0].stable_frames == 0
+    assert state.candidate_tracks[0].union_bbox == growing_bbox
+
+    # frames 3 and 4: same bbox, fully contained in the (now-fixed) union -- stable_frames climbs
+    for expected, frame_idx in [(1, 2), (2, 3)]:
+        cand = RawCandidate(centroid=(15.0, 15.0), bbox=growing_bbox, mask=np.ones((5, 5), dtype=bool))
+        _update_candidate_tracks(state, [cand], residual, frame_index=frame_idx)
+        assert state.candidate_tracks[0].stable_frames == expected
+        assert state.candidate_tracks[0].union_bbox == growing_bbox
+
+
+def test_stability_frames_delays_promotion_until_shape_stabilizes():
+    # PromotionParams.stability_frames=0 (default) is a pure no-op --
+    # promotion timing matches the original consecutive-frames-only
+    # behavior. A cell whose detected footprint grows in two visible
+    # stages (a barely-above-threshold onset, then a later jump to full
+    # brightness) should promote LATER once stability_frames requires the
+    # footprint to stop growing first -- the paper's Algorithm 1 step 12
+    # ("not updated in the last few frames") criterion, as opposed to just
+    # having been seen for enough consecutive frames.
+    from seudo.streaming import PromotionParams
+
+    y, x, f = 30, 60, 150
+    prof0 = gaussian_patch((y, x), center=(15, 15), sigma=2.0)
+    prof0[prof0 < 0.05 * prof0.max()] = 0.0
+    prof1 = gaussian_patch((y, x), center=(15, 45), sigma=2.0)
+    prof1[prof1 < 0.05 * prof1.max()] = 0.0
+
+    onset, ramp_len = 30, 15
+    rng = np.random.default_rng(1)
+    act0 = np.full(f, 2.0)
+    act1 = np.zeros(f)
+    act1[onset:onset + ramp_len] = 0.7    # barely-detectable onset: small footprint
+    act1[onset + ramp_len:] = 3.0          # then a real jump: footprint grows
+
+    movie = np.zeros((y, x, f))
+    for ff in range(f):
+        movie[:, :, ff] = prof0 * act0[ff] + prof1 * act1[ff] + 0.005 * rng.normal(size=(y, x))
+
+    def run(stability_frames):
+        promotion = PromotionParams(consecutive_frames_required=3, stability_frames=stability_frames)
+        state = StreamingState((y, x), initial_profiles=prof0[:, :, np.newaxis],
+                                fit=default_streaming_fit(), promotion=promotion)
+        for ff in range(f):
+            result = realSEUDOfit(movie[:, :, ff], state)
+            if result.new_cells:
+                return ff
+        return None
+
+    promoted_off = run(stability_frames=0)
+    promoted_on = run(stability_frames=5)
+    assert promoted_off is not None and promoted_on is not None
+    assert promoted_on > promoted_off, (
+        'requiring the footprint to stabilize first should delay promotion, '
+        f'got off={promoted_off} on={promoted_on}')
+
+
 def test_lookahead_frames_default_warns_and_returns_none_during_warmup():
     y, x = 20, 20
     with pytest.warns(UserWarning, match='lookahead buffer'):
