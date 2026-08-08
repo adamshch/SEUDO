@@ -820,3 +820,132 @@ def test_max_roi_extent_rejects_a_large_diffuse_region():
     assert n_tracks_uncapped >= 2, 'sanity check: both the gradient region and the real cell get tracked uncapped'
     assert n_cells_capped == 1, 'only the real cell should survive with the cap on'
     assert n_cells_capped < n_cells_uncapped
+
+
+def test_rejected_regions_are_quarantined_not_rescanned_every_frame():
+    # a noisy (not perfectly static) oversized region -- without permanent
+    # quarantine, rejecting it fresh every frame lets different noise-driven
+    # sub-regions randomly sneak under the cap on different frames,
+    # fragmenting into multiple spurious tracks over time (confirmed this
+    # is a REAL effect on real data: capping alone made results measurably
+    # worse). With quarantine, the region should be excluded after its
+    # first rejection and never contribute a spurious track again, while a
+    # real cell elsewhere keeps working normally.
+    from seudo.streaming import _quarantine_rejected_regions
+
+    y, x, f = 120, 120, 40
+    rng = np.random.default_rng(0)
+    cell = gaussian_patch((y, x), center=(95, 95), sigma=2.0)
+    cell[cell < 0.05 * cell.max()] = 0.0
+
+    frames = []
+    for _ in range(f):
+        gradient = 3.0 + rng.normal(0, 0.3, size=(60, 60))
+        frame = np.zeros((y, x))
+        frame[:60, :60] = gradient
+        frame += cell * 3.0
+        frames.append(frame)
+
+    common = dict(sigma2=0.002, lambda_blob=10.0, blob_radius=3.0, pad_space=5, use_native=False)
+    fit = FitParams(**common)
+    detection = DetectionParams(max_roi_extent=35)
+    state = StreamingState((y, x), fit=fit, detection=detection)
+    for frame in frames:
+        realSEUDOfit(frame, state)
+
+    assert state.profiles.shape[2] == 1, 'only the real cell should ever be promoted'
+    assert state._next_track_id == 1, (
+        'the noisy oversized region should never fragment into spurious tracks once quarantined')
+    assert state.rejected_region_mask[:60, :60].sum() > 0, (
+        'the quarantine mask should cover (at least part of) the rejected region')
+
+
+def test_quarantine_rejected_regions_expands_bbox_by_exclude_radius():
+    from seudo.streaming import _quarantine_rejected_regions
+
+    y, x = 30, 30
+    state = StreamingState((y, x), fit=default_streaming_fit(),
+                            detection=DetectionParams(exclude_radius_known_cells=3))
+    _quarantine_rejected_regions(state, [(10, 15, 10, 15)])
+
+    assert state.rejected_region_mask[10:16, 10:16].all(), 'the rejected bbox itself must be quarantined'
+    assert state.rejected_region_mask[7, 10], 'quarantine should expand by exclude_radius_known_cells'
+    assert not state.rejected_region_mask[6, 10], 'expansion should not go further than exclude_radius_known_cells'
+
+
+def test_eq9_containment_ratios():
+    # direct check of the paper's Eq. 9 formula (realSEUDO sec 3.2),
+    # independent of the rest of the promotion machinery
+    from seudo.streaming import _eq9_containment_ratios
+
+    y, x = 30, 30
+    b = gaussian_patch((y, x), center=(15, 15), sigma=2.0)
+    b[b < 0.05 * b.max()] = 0.0
+
+    # same shape, different amplitude -- A fits entirely inside B and vice versa
+    a_same_shape = b * 0.6
+    rho_ab, rho_ba = _eq9_containment_ratios(a_same_shape, b)
+    np.testing.assert_allclose([rho_ab, rho_ba], [1.0, 1.0], atol=1e-8)
+
+    # A is a strict spatial subset of B's own footprint -- A fits fully
+    # inside B (rho_ab=1) but B does NOT fit inside A (rho_ba << 1):
+    # exactly the asymmetric signature the paper uses to flag a split
+    # candidate, distinct from a clean merge
+    ys, xs = np.nonzero(b > 0)
+    cy, cx = int(ys.mean()), int(xs.mean())
+    mask = np.zeros_like(b, dtype=bool)
+    mask[:cy, :cx] = True
+    a_partial = np.where(mask, b, 0.0)
+    rho_ab, rho_ba = _eq9_containment_ratios(a_partial, b)
+    assert rho_ab > 0.99
+    assert rho_ba < 0.2
+
+    # no spatial overlap at all
+    c = gaussian_patch((y, x), center=(2, 2), sigma=1.0)
+    c[c < 0.05 * c.max()] = 0.0
+    assert _eq9_containment_ratios(b, c) == (0.0, 0.0)
+
+
+def test_find_stable_merge_target():
+    from seudo.streaming import _find_stable_merge_target
+
+    y, x = 30, 30
+    prof = gaussian_patch((y, x), center=(15, 15), sigma=2.0)
+    prof[prof < 0.05 * prof.max()] = 0.0
+
+    state = StreamingState((y, x), initial_profiles=prof[:, :, np.newaxis], fit=default_streaming_fit())
+
+    # a near-duplicate of the existing cell (different amplitude, same shape)
+    duplicate = prof * 0.7
+    assert _find_stable_merge_target(state, duplicate) == 0
+
+    # two nearby-but-genuinely-distinct cells (same scenario as the joint-
+    # fit test) should NOT be flagged as the same cell
+    distinct = gaussian_patch((y, x), center=(15, 19), sigma=2.0)
+    distinct[distinct < 0.05 * distinct.max()] = 0.0
+    assert _find_stable_merge_target(state, distinct) is None
+
+
+def test_promote_candidate_merges_duplicate_instead_of_creating_new_cell():
+    # a candidate track whose built profile turns out to be (nearly) the
+    # same shape as an ALREADY-known cell -- Eq. 9 should merge it into the
+    # existing cell rather than adding a redundant duplicate profile
+    from seudo.streaming import CandidateTrack, _promote_candidate
+
+    y, x = 30, 30
+    prof = gaussian_patch((y, x), center=(15, 15), sigma=2.0)
+    prof[prof < 0.05 * prof.max()] = 0.0
+
+    state = StreamingState((y, x), initial_profiles=prof[:, :, np.newaxis], fit=default_streaming_fit())
+    n_before = state.profiles.shape[2]
+
+    bbox = (10, 20, 10, 20)
+    crop = prof[bbox[0]:bbox[1] + 1, bbox[2]:bbox[3] + 1]
+    mask = crop > 0
+    track = CandidateTrack(centroid=(15.0, 15.0), consecutive_frames=3, gap=0,
+                            history=[(0, bbox, mask, crop * 0.8)] * 3)
+
+    cell_id, is_new = _promote_candidate(state, track, frame_index=0)
+    assert is_new is False
+    assert cell_id == 0
+    assert state.profiles.shape[2] == n_before, 'no duplicate profile should have been added'

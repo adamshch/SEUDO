@@ -355,6 +355,7 @@ class StreamingState:
         self.first_detected_frame = {}
         self._cell_setups = {}
         self.known_cell_exclude_mask = np.zeros((self.mov_y, self.mov_x), dtype=bool)
+        self.rejected_region_mask = np.zeros((self.mov_y, self.mov_x), dtype=bool)
         self.candidate_tracks = {}
         self._next_track_id = 0
 
@@ -416,6 +417,34 @@ def _update_known_cell_exclude_mask(state, cell_id, y0, y1, x0, x1):
         structure = np.ones((2 * r + 1, 2 * r + 1), dtype=bool)
         footprint = ndimage.binary_dilation(footprint, structure=structure)
     state.known_cell_exclude_mask[y0:y1 + 1, x0:x1 + 1] |= footprint
+
+
+def _quarantine_rejected_regions(state, rejected_bboxes):
+    """Permanently exclude a region rejected for being physically too large
+    to be a real cell (see DetectionParams.max_roi_extent) from all future
+    scanning, the same way a promoted cell's footprint is excluded --
+    without this, a region that's too large gets discarded and then
+    re-detected (and re-rejected) from scratch every single frame, which on
+    real data actually made things WORSE than no cap at all: a rejected-
+    but-not-excluded region keeps getting rescanned and can fragment into
+    several smaller, under-the-cap spurious detections over time instead of
+    being cleanly ignored. Applied AFTER this frame's own detection passes
+    already ran (see realSEUDOfit) -- causal, takes effect starting next
+    frame, never retroactively changes what this frame just did.
+
+    Trade-off, not a free lunch: a genuinely large one-off event (e.g. a
+    real transient artifact, or two real cells briefly merging into one
+    oversized blob in a single noisy frame) gets quarantined just as
+    permanently as a truly static illumination artifact -- there's no
+    decay or re-evaluation once a region is quarantined here."""
+    r = state.detection.exclude_radius_known_cells
+    for y0, y1, x0, x1 in rejected_bboxes:
+        # the rejected region is a solid (unbroken) rectangle, so dilating
+        # it by r is exactly equivalent to expanding the rectangle by r
+        # pixels on each side -- no need for an actual binary_dilation call
+        py0, py1 = max(0, y0 - r), min(state.mov_y - 1, y1 + r)
+        px0, px1 = max(0, x0 - r), min(state.mov_x - 1, x1 + r)
+        state.rejected_region_mask[py0:py1 + 1, px0:px1 + 1] = True
 
 
 def _estimate_noise_level(residual, scale):
@@ -502,7 +531,14 @@ def _detect_in_tile(crop, noise_crop, mask, tile, detection):
     """The expensive part of tile detection: dilate + connected-component
     label + per-component size/brightness filtering. Only ever called for a
     tile _tile_threshold_mask already found non-blank -- this is the part
-    worth parallelizing across tiles (see realSEUDOfit)."""
+    worth parallelizing across tiles (see realSEUDOfit).
+
+    Returns (candidates, rejected_bboxes): rejected_bboxes are components
+    that failed SPECIFICALLY the max_roi_extent check (global bbox coords)
+    -- not the min_roi_size/min_avg_px/tile-membership rejections, which
+    don't mean "this region is permanently not a cell," just "not yet" or
+    "belongs to a neighboring tile." See realSEUDOfit for how these feed
+    into a persistent quarantine mask."""
     hy0, _hy1, hx0, _hx1 = tile.halo
     cy0, cy1, cx0, cx1 = tile.core
 
@@ -514,6 +550,7 @@ def _detect_in_tile(crop, noise_crop, mask, tile, detection):
     labeled, n = ndimage.label(mask)
 
     candidates = []
+    rejected_bboxes = []
     for label_id in range(1, n + 1):
         comp_mask = labeled == label_id
         size = int(comp_mask.sum())
@@ -529,6 +566,7 @@ def _detect_in_tile(crop, noise_crop, mask, tile, detection):
         # anomalous in any single dimension, unlike e.g. a broad
         # illumination-gradient region that's large in both).
         if detection.max_roi_extent is not None and max(ly1 - ly0 + 1, lx1 - lx0 + 1) > detection.max_roi_extent:
+            rejected_bboxes.append((ly0 + hy0, ly1 + hy0, lx0 + hx0, lx1 + hx0))
             continue
 
         # local noise level for THIS component, not a single frame-wide
@@ -557,7 +595,7 @@ def _detect_in_tile(crop, noise_crop, mask, tile, detection):
 
         candidates.append(RawCandidate(centroid=centroid_global, bbox=bbox_global, mask=local_mask))
 
-    return candidates
+    return candidates, rejected_bboxes
 
 
 def _run_tile_detection(state, smoothed, noise_map, exclude_mask):
@@ -566,7 +604,9 @@ def _run_tile_detection(state, smoothed, noise_map, exclude_mask):
     dilate+label+filter -- in the thread pool when it's worth it -- only for
     tiles found non-blank. Used twice per frame: once against R1 (to find
     candidates for matching against existing tracks) and once against R2
-    (to find genuinely new ones) -- see realSEUDOfit."""
+    (to find genuinely new ones) -- see realSEUDOfit.
+
+    Returns (raw_candidates, rejected_bboxes) -- see _detect_in_tile."""
     non_blank_tiles = []
     for tile in state.tiles:
         hit = _tile_threshold_mask(smoothed, noise_map, tile, exclude_mask, state.detection)
@@ -574,16 +614,21 @@ def _run_tile_detection(state, smoothed, noise_map, exclude_mask):
             non_blank_tiles.append((tile, hit))
 
     raw_candidates = []
+    rejected_bboxes = []
     if state._executor is not None and len(non_blank_tiles) > 1:
         futures = [state._executor.submit(_detect_in_tile, crop, noise_crop, mask, tile, state.detection)
                    for tile, (crop, noise_crop, mask) in non_blank_tiles]
         for fut in futures:
-            raw_candidates.extend(fut.result())
+            cands, rejected = fut.result()
+            raw_candidates.extend(cands)
+            rejected_bboxes.extend(rejected)
     else:
         for tile, (crop, noise_crop, mask) in non_blank_tiles:
-            raw_candidates.extend(_detect_in_tile(crop, noise_crop, mask, tile, state.detection))
+            cands, rejected = _detect_in_tile(crop, noise_crop, mask, tile, state.detection)
+            raw_candidates.extend(cands)
+            rejected_bboxes.extend(rejected)
 
-    return raw_candidates
+    return raw_candidates, rejected_bboxes
 
 
 def _update_candidate_tracks(state, raw_candidates, residual, frame_index):
@@ -817,8 +862,73 @@ def _build_promoted_profile(track, mov_shape):
     return profile, (y0, y1, x0, x1)
 
 
+def _eq9_containment_ratios(profile_a, profile_b):
+    """realSEUDO paper Eq. 9 (sec 3.2): containment ratios between two
+    profiles, computed at the moment a candidate is about to be promoted
+    (Algorithm 1 step 14: "merge the moved profile with existing Xstab
+    profiles"). alpha_AB = <A,B>/<A,A> is the best-fit scalar explaining B
+    using A's WHOLE shape; beta_AB is the same fit but restricted to just
+    A's own footprint overlapping B (a measure of relative brightness in
+    the shared area, per the paper's own framing). rho_AB = alpha_AB /
+    beta_AB sits close to 1 exactly when fitting A's whole shape gives
+    basically the same answer as fitting just its overlap with B -- i.e. A
+    is essentially entirely contained within B, not partially. Symmetric
+    for BA. Returns (0.0, 0.0) if the profiles don't overlap at all."""
+    overlap = (profile_a > 0) & (profile_b > 0)
+    if not overlap.any():
+        return 0.0, 0.0
+
+    dot_ab = float(np.sum(profile_a * profile_b))
+    dot_aa = float(np.sum(profile_a * profile_a))
+    dot_bb = float(np.sum(profile_b * profile_b))
+    alpha_ab = dot_ab / dot_aa if dot_aa > 0 else 0.0
+    alpha_ba = dot_ab / dot_bb if dot_bb > 0 else 0.0
+
+    a_ol = np.where(overlap, profile_a, 0.0)
+    b_ol = np.where(overlap, profile_b, 0.0)
+    dot_aol_aol = float(np.sum(a_ol * a_ol))
+    dot_bol_bol = float(np.sum(b_ol * b_ol))
+    dot_aol_b = float(np.sum(a_ol * profile_b))
+    dot_bol_a = float(np.sum(b_ol * profile_a))
+    beta_ab = dot_aol_b / dot_aol_aol if dot_aol_aol > 0 else 0.0
+    beta_ba = dot_bol_a / dot_bol_bol if dot_bol_bol > 0 else 0.0
+
+    rho_ab = alpha_ab / beta_ab if beta_ab != 0 else 0.0
+    rho_ba = alpha_ba / beta_ba if beta_ba != 0 else 0.0
+    return rho_ab, rho_ba
+
+
+def _find_stable_merge_target(state, profile, k_stab=0.75):
+    """Eq. 9 merge half only (the split half -- decomposing an existing
+    cell into two -- is a separate, not-yet-implemented feature; see
+    streaming.py's module docstring / project notes). Compares `profile`
+    (a candidate about to be promoted) against every EXISTING known cell;
+    if BOTH containment ratios clear k_stab, they represent the same
+    underlying cell and should be merged rather than added as a duplicate
+    -- exactly the paper's condition for a merge (both ratios above the
+    limit), as opposed to a split (only one ratio above it, asymmetric).
+    k_stab=0.75 matches rois_params.m's own combine_far_min_common default
+    for this exact check (same value Eq. 8's k_temp uses at the Xtemp
+    stage, rois_params.m's combine_near_min_common -- both 0.75 in the
+    reference). Returns the existing cell_id to merge into, or None."""
+    for cell_id in range(state.profiles.shape[2]):
+        rho_ab, rho_ba = _eq9_containment_ratios(profile, state.profiles[:, :, cell_id])
+        if rho_ab >= k_stab and rho_ba >= k_stab:
+            return cell_id
+    return None
+
+
 def _promote_candidate(state, track, frame_index):
+    """Returns (cell_id, is_new). is_new=False means the candidate was
+    merged into an already-known cell (Eq. 9) rather than added as a
+    duplicate -- the caller should not treat cell_id as a newly-promoted
+    cell in that case (it's already been fit and reported this frame)."""
     profile, _bbox = _build_promoted_profile(track, (state.mov_y, state.mov_x))
+
+    merge_target = _find_stable_merge_target(state, profile)
+    if merge_target is not None:
+        return merge_target, False
+
     new_id = state.profiles.shape[2]
     state.profiles = np.concatenate([state.profiles, profile[:, :, np.newaxis]], axis=2)
     state.first_detected_frame[new_id] = frame_index
@@ -827,7 +937,7 @@ def _promote_candidate(state, track, frame_index):
     _add_cell_setup(state, new_id, y0, y1, x0, x1)
     _invalidate_overlapping_setups(state, new_id, y0, y1, x0, x1)
     _update_known_cell_exclude_mask(state, new_id, y0, y1, x0, x1)
-    return new_id
+    return new_id, True
 
 
 def _fit_cell(state, frame, cell_id):
@@ -905,9 +1015,13 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
 
     # detect on R1 (raw residual after known-cell fitting) and advance every
     # existing track by centroid-matching against it -- unchanged from
-    # before two-stage detection; see _update_candidate_tracks.
+    # before two-stage detection; see _update_candidate_tracks. Also
+    # excludes rejected_region_mask -- a region quarantined (see
+    # _quarantine_rejected_regions) for being too large to be a real cell
+    # on some earlier frame should never be rescanned either.
+    base_exclude_mask = state.known_cell_exclude_mask | state.rejected_region_mask
     smoothed = convolve2d(residual, state.detect_blob, mode='same')
-    raw_candidates = _run_tile_detection(state, smoothed, noise_map, state.known_cell_exclude_mask)
+    raw_candidates, rejected_bboxes = _run_tile_detection(state, smoothed, noise_map, base_exclude_mask)
     _update_candidate_tracks(state, raw_candidates, residual, frame_index)
 
     # two-stage detection: fit every currently-active track's own evolving
@@ -917,8 +1031,8 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     # residual (already accounted for above) can never spawn a duplicate.
     #
     # With no active tracks, R2 is bit-identical to R1 (nothing to
-    # subtract) and the exclude mask is bit-identical to known_cell_exclude_
-    # mask alone (candidate_exclude_mask would be empty) -- so a second
+    # subtract) and the exclude mask is bit-identical to base_exclude_mask
+    # alone (candidate_exclude_mask would be empty) -- so a second
     # detection pass would just recompute exactly what the first pass
     # already found. Skip it and reuse raw_candidates directly: most frames
     # in a real run have zero in-progress candidates (promotion only takes
@@ -926,23 +1040,33 @@ def realSEUDOfit(frame, state, frame_index=None, zero_level=None):
     # tile scan on the common case, not an approximation.
     if state.candidate_tracks:
         residual2, candidate_exclude_mask, track_footprints = _subtract_tracked_contributions(state, residual)
-        combined_exclude_mask = state.known_cell_exclude_mask | candidate_exclude_mask
+        combined_exclude_mask = base_exclude_mask | candidate_exclude_mask
         smoothed2 = convolve2d(residual2, state.detect_blob, mode='same')
-        raw_candidates_new = _run_tile_detection(state, smoothed2, noise_map, combined_exclude_mask)
+        raw_candidates_new, rejected_bboxes_2 = _run_tile_detection(state, smoothed2, noise_map, combined_exclude_mask)
+        rejected_bboxes = rejected_bboxes + rejected_bboxes_2
     else:
         raw_candidates_new = raw_candidates
         track_footprints = []
     _start_candidate_tracks(state, raw_candidates_new, residual, frame_index, track_footprints)
+
+    # apply AFTER this frame's own detection passes already ran -- causal,
+    # takes effect starting next frame (see _quarantine_rejected_regions).
+    if rejected_bboxes:
+        _quarantine_rejected_regions(state, rejected_bboxes)
 
     new_cells = []
     ready = [tid for tid, t in state.candidate_tracks.items()
              if t.consecutive_frames >= state.promotion.consecutive_frames_required]
     for track_id in ready:
         track = state.candidate_tracks.pop(track_id)
-        new_id = _promote_candidate(state, track, frame_index)
-        value, _bbox = _fit_cell(state, avg_frame, new_id)
-        activity[new_id] = value
-        new_cells.append(new_id)
+        cell_id, is_new = _promote_candidate(state, track, frame_index)
+        if is_new:
+            value, _bbox = _fit_cell(state, avg_frame, cell_id)
+            activity[cell_id] = value
+            new_cells.append(cell_id)
+        # else: merged into an existing cell (Eq. 9) -- that cell was
+        # already fit and reported earlier this frame, in the known-cell
+        # loop above; nothing further to report for this track.
 
     state.frame_index = frame_index + 1
     return FrameResult(frame_index=frame_index, activity=activity, new_cells=new_cells)
