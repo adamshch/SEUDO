@@ -37,8 +37,20 @@ PROGRESS_EVERY = 500
 # ds_time no longer need to be passed explicitly (both are FitParams
 # defaults now), but spelled out here for a self-documenting record of
 # what this run used.
+#
+# spatial_denoise_radius=2.0: the paper-vs-code audit's item 3 -- the paper
+# preprocesses every incoming frame with a spatial Gaussian filter AND a
+# temporal running average before any fitting, we only had the temporal
+# half until now. Real-data sweep on a 3000-frame window (None/1.0/1.5/2.0/
+# 3.0) found radius=2.0 the clear standout: matched CNMF cells jumped
+# 20->32 (+60%) for only 1->3 new false positives -- by far the single
+# biggest recall improvement found in this whole audit. radius=3.0 is
+# dramatically slower (165ms/frame vs 35ms) for worse recall, so not
+# just "bigger is better" -- this value was chosen from real measurement,
+# not guessed.
 SEUDO_PARAMS = dict(sigma2=0.0020, lambda_blob=10.0, blob_radius=3.0, pad_space=5,
-                     n_jobs=8, native_nthreads=4, blob_spacing=3.0, ds_time=3)
+                     n_jobs=8, native_nthreads=4, blob_spacing=3.0, ds_time=3,
+                     spatial_denoise_radius=2.0)
 
 # real-data one-at-a-time sweep (scripts/benchmark_detection_params.py) found
 # these three -- none with a reference value from the paper or rois_params.m,
