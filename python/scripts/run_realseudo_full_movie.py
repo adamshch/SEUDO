@@ -31,12 +31,16 @@ N_FRAMES = None    # None = the whole movie
 PROGRESS_EVERY = 500
 
 # same demo.m-derived defaults used elsewhere in this project for this
-# dataset, plus the validated n_jobs/native_nthreads combo, the blob_spacing=3
-# default, and ds_time=3 (a causal trailing 3-frame average, added to reduce
-# per-pixel noise -- see FitParams.ds_time's docstring). blob_spacing and
-# ds_time no longer need to be passed explicitly (both are FitParams
-# defaults now), but spelled out here for a self-documenting record of
-# what this run used.
+# dataset, plus the validated n_jobs/native_nthreads combo and the
+# blob_spacing=3 default. Temporal smoothing now comes from
+# lookahead_frames=3 (a FitParams default -- see its docstring), which
+# superseded the earlier ds_time=3 (causal trailing average) after a
+# direct real-data A/B test found the forward-looking version measurably
+# better (34/52 vs. 32/52 matched CNMF cells over the same 3000-frame
+# window) -- ds_time is no longer set here since lookahead_frames takes
+# over the averaging entirely whenever it's > 1. This also means
+# realSEUDOfit can return None early on and reports on a lagged
+# frame_index -- see run_discovery's handling of that below.
 #
 # spatial_denoise_radius=2.0: the paper-vs-code audit's item 3 -- the paper
 # preprocesses every incoming frame with a spatial Gaussian filter AND a
@@ -49,7 +53,7 @@ PROGRESS_EVERY = 500
 # just "bigger is better" -- this value was chosen from real measurement,
 # not guessed.
 SEUDO_PARAMS = dict(sigma2=0.0020, lambda_blob=10.0, blob_radius=3.0, pad_space=5,
-                     n_jobs=8, native_nthreads=4, blob_spacing=3.0, ds_time=3,
+                     n_jobs=8, native_nthreads=4, blob_spacing=3.0,
                      spatial_denoise_radius=2.0)
 
 # real-data one-at-a-time sweep (scripts/benchmark_detection_params.py) found
@@ -72,16 +76,23 @@ def run_discovery(movie, n_frames):
         movie.shape[:2], fit=FitParams(**SEUDO_PARAMS),
         detection=DetectionParams(**DETECTION_PARAMS), promotion=PromotionParams(**PROMOTION_PARAMS),
     )
-    activity_by_frame = []
+    # keyed by result.frame_index, not loop position -- with
+    # FitParams.lookahead_frames > 1 (the default), realSEUDOfit returns
+    # None for the first lookahead_frames-1 calls (not enough future
+    # context yet) and every reported frame_index lags the raw input frame
+    # ff by lookahead_frames-1, so the two are no longer interchangeable.
+    activity_by_frame = {}
 
     t0 = time.time()
     for ff in range(n_frames):
         frame = movie.get_frame(ff)
         result = realSEUDOfit(frame, state)
-        activity_by_frame.append(result.activity)
+        if result is None:
+            continue
+        activity_by_frame[result.frame_index] = result.activity
 
         if result.new_cells:
-            print(f'  frame {ff}: discovered cell(s) {result.new_cells} '
+            print(f'  frame {result.frame_index}: discovered cell(s) {result.new_cells} '
                   f'(total so far: {state.profiles.shape[2]})', flush=True)
 
         if (ff + 1) % PROGRESS_EVERY == 0:
@@ -96,9 +107,9 @@ def run_discovery(movie, n_frames):
 
     n_cells = state.profiles.shape[2]
     discovered_tc = np.full((n_frames, n_cells), np.nan)
-    for ff, activity in enumerate(activity_by_frame):
+    for frame_idx, activity in activity_by_frame.items():
         for cell_id, value in activity.items():
-            discovered_tc[ff, cell_id] = value
+            discovered_tc[frame_idx, cell_id] = value
 
     total_elapsed = time.time() - t0
     return state, discovered_tc, total_elapsed

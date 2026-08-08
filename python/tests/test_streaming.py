@@ -3,6 +3,8 @@ realSEUDOfit() fits one frame at a time against a growing cell-profile set,
 detecting and promoting new cells as they appear.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -50,7 +52,7 @@ def test_parity_with_offline_solver_frame_by_frame():
     offline = estimate_time_courses_with_seudo(movie, profiles, ds_time=1, **COMMON_FIT)
     offline_tc = offline['tc'][:, 0]
 
-    state = StreamingState((y, x), initial_profiles=profiles, fit=FitParams(**COMMON_FIT))
+    state = StreamingState((y, x), initial_profiles=profiles, fit=FitParams(**COMMON_FIT, lookahead_frames=1))
     streaming_tc = np.array([realSEUDOfit(movie[:, :, ff], state).activity[0] for ff in range(f)])
 
     np.testing.assert_allclose(streaming_tc, offline_tc, atol=1e-8)
@@ -76,7 +78,11 @@ def make_two_cell_movie(seed=1, onset=50, y=30, x=60, f=100):
 
 
 def default_streaming_fit():
-    return FitParams(sigma2=0.002, lambda_blob=10.0, blob_radius=3.0, pad_space=5, use_native=False)
+    # lookahead_frames=1: disable the new default lookahead buffer -- these
+    # tests assume realSEUDOfit's original immediate-result, never-None
+    # contract (lookahead behavior itself is tested separately, explicitly)
+    return FitParams(sigma2=0.002, lambda_blob=10.0, blob_radius=3.0, pad_space=5, use_native=False,
+                      lookahead_frames=1)
 
 
 def test_bounded_latency_new_cell_detection():
@@ -391,7 +397,7 @@ def test_blob_spacing_changes_native_result():
 
     def run(blob_spacing):
         fit = FitParams(sigma2=0.02, lambda_blob=1.0, blob_radius=1.2, pad_space=6,
-                         use_native=True, blob_spacing=blob_spacing, solver_max_iter=300)
+                         use_native=True, blob_spacing=blob_spacing, solver_max_iter=300, lookahead_frames=1)
         state = StreamingState((y, x), initial_profiles=profiles, fit=fit)
         return [realSEUDOfit(frame, state).activity[0] for frame in frames]
 
@@ -405,7 +411,7 @@ def test_blob_spacing_is_a_noop_for_python_fallback():
 
     def run(blob_spacing):
         fit = FitParams(sigma2=0.02, lambda_blob=1.0, blob_radius=1.2, pad_space=6,
-                         use_native=False, blob_spacing=blob_spacing, solver_max_iter=300)
+                         use_native=False, blob_spacing=blob_spacing, solver_max_iter=300, lookahead_frames=1)
         state = StreamingState((y, x), initial_profiles=profiles, fit=fit)
         return [realSEUDOfit(frame, state).activity[0] for frame in frames]
 
@@ -576,7 +582,7 @@ def test_ds_time_default_is_a_noop():
     # floating-point change), so behavior is bit-identical to every test
     # above that never mentions ds_time at all.
     y, x = 20, 20
-    fit = FitParams(sigma2=0.02)
+    fit = FitParams(sigma2=0.02, lookahead_frames=1)
     state = StreamingState((y, x), fit=fit)
     assert state.sigma2_ds == fit.sigma2
 
@@ -657,7 +663,7 @@ def test_blobify_radius_defaults_to_mirroring_fit_blob_radius():
     # to one_blob -- the exact coupled behavior this module always had
     # before blobify_radius existed as an independent knob
     y, x = 20, 20
-    fit = FitParams(blob_radius=2.5)
+    fit = FitParams(blob_radius=2.5, lookahead_frames=1)
     state = StreamingState((y, x), fit=fit)
     np.testing.assert_array_equal(state.detect_blob, state.one_blob)
 
@@ -666,7 +672,7 @@ def test_blobify_radius_override_produces_a_different_kernel():
     # an explicit blobify_radius should genuinely decouple detection
     # smoothing from the fit's own blob dictionary, not silently be ignored
     y, x = 20, 20
-    fit = FitParams(blob_radius=3.0)
+    fit = FitParams(blob_radius=3.0, lookahead_frames=1)
     detection = DetectionParams(blobify_radius=1.2)
     state = StreamingState((y, x), fit=fit, detection=detection)
     assert state.detect_blob.shape != state.one_blob.shape
@@ -747,7 +753,7 @@ def test_start_candidate_tracks_still_creates_a_track_for_a_disjoint_candidate()
 
 def test_spatial_denoise_radius_default_is_a_noop():
     y, x = 20, 20
-    state = StreamingState((y, x), fit=FitParams())
+    state = StreamingState((y, x), fit=FitParams(lookahead_frames=1))
     assert state.denoise_kernel is None
 
 
@@ -755,7 +761,7 @@ def test_spatial_denoise_radius_builds_a_sum_normalized_kernel():
     # a smoothing filter must preserve overall intensity (sum to ~1), unlike
     # make_seudo_blob's L2-normalized SEUDO basis-function convention
     y, x = 20, 20
-    state = StreamingState((y, x), fit=FitParams(spatial_denoise_radius=1.5))
+    state = StreamingState((y, x), fit=FitParams(spatial_denoise_radius=1.5, lookahead_frames=1))
     assert state.denoise_kernel is not None
     np.testing.assert_allclose(state.denoise_kernel.sum(), 1.0, atol=1e-10)
 
@@ -802,7 +808,7 @@ def test_max_roi_extent_rejects_a_large_diffuse_region():
     cell[cell < 0.05 * cell.max()] = 0.0
 
     frames = [gradient + cell * 3.0 for _ in range(f)]
-    common = dict(sigma2=0.002, lambda_blob=10.0, blob_radius=3.0, pad_space=5, use_native=False)
+    common = dict(sigma2=0.002, lambda_blob=10.0, blob_radius=3.0, pad_space=5, use_native=False, lookahead_frames=1)
 
     def run(max_roi_extent):
         fit = FitParams(**common)
@@ -846,7 +852,7 @@ def test_rejected_regions_are_quarantined_not_rescanned_every_frame():
         frame += cell * 3.0
         frames.append(frame)
 
-    common = dict(sigma2=0.002, lambda_blob=10.0, blob_radius=3.0, pad_space=5, use_native=False)
+    common = dict(sigma2=0.002, lambda_blob=10.0, blob_radius=3.0, pad_space=5, use_native=False, lookahead_frames=1)
     fit = FitParams(**common)
     detection = DetectionParams(max_roi_extent=35)
     state = StreamingState((y, x), fit=fit, detection=detection)
@@ -949,3 +955,50 @@ def test_promote_candidate_merges_duplicate_instead_of_creating_new_cell():
     assert is_new is False
     assert cell_id == 0
     assert state.profiles.shape[2] == n_before, 'no duplicate profile should have been added'
+
+
+def test_lookahead_frames_default_warns_and_returns_none_during_warmup():
+    y, x = 20, 20
+    with pytest.warns(UserWarning, match='lookahead buffer'):
+        state = StreamingState((y, x), fit=FitParams())  # lookahead_frames=3, the default
+
+    frame = np.zeros((y, x))
+    assert realSEUDOfit(frame, state) is None, 'not enough future context yet after 1 call'
+    assert realSEUDOfit(frame, state) is None, 'not enough future context yet after 2 calls'
+    assert realSEUDOfit(frame, state) is not None, '3rd call should finally have a full window'
+
+
+def test_lookahead_frames_1_never_warns_or_returns_none():
+    y, x = 20, 20
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')  # any warning here should fail the test
+        state = StreamingState((y, x), fit=FitParams(lookahead_frames=1))
+    frame = np.zeros((y, x))
+    assert realSEUDOfit(frame, state) is not None, 'lookahead_frames=1 should never buffer/return None'
+
+
+def test_lookahead_frames_reports_correctly_lagged_frame_index_and_average():
+    # a single known cell with a noise-free step in true activity, mirroring
+    # test_ds_time_smooths_a_stepped_activity_trace but for the forward-
+    # looking buffer -- hand-computed expected values, not just "some
+    # smoothing happens": frame_index in each FrameResult must equal the
+    # RAW input frame index minus (lookahead_frames-1), and the reported
+    # activity must equal the true mean over that forward window.
+    y, x, f = 30, 30, 9
+    prof = gaussian_patch((y, x), center=(15, 15), sigma=2.0)
+    prof[prof < 0.05 * prof.max()] = 0.0
+
+    act = np.full(f, 2.0)
+    act[5:] = 8.0
+    movie = np.stack([prof * act[ff] for ff in range(f)], axis=2)
+
+    fit = FitParams(**{**vars(default_streaming_fit()), 'lookahead_frames': 3})
+    state = StreamingState((y, x), initial_profiles=prof[:, :, np.newaxis], fit=fit)
+
+    results = [realSEUDOfit(movie[:, :, k], state) for k in range(f)]
+
+    assert results[0] is None and results[1] is None
+    expected = {2: (0, 2.0), 3: (1, 2.0), 4: (2, 2.0), 5: (3, 4.0), 6: (4, 6.0), 7: (5, 8.0), 8: (6, 8.0)}
+    for k, (expected_frame_index, expected_activity) in expected.items():
+        assert results[k].frame_index == expected_frame_index
+        assert np.isclose(results[k].activity[0], expected_activity, atol=1e-6)

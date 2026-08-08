@@ -48,16 +48,23 @@ SEUDO_PARAMS = dict(sigma2=0.0020, lambda_blob=10.0, blob_radius=3.0, pad_space=
 
 def run_discovery(movie, n_frames):
     state = StreamingState(movie.shape[:2], fit=FitParams(**SEUDO_PARAMS))
-    activity_by_frame = []
+    # keyed by result.frame_index, not loop position -- with
+    # FitParams.lookahead_frames > 1 (the default), realSEUDOfit returns
+    # None for the first lookahead_frames-1 calls (not enough future
+    # context yet) and every reported frame_index lags the raw input frame
+    # ff by lookahead_frames-1, so the two are no longer interchangeable.
+    activity_by_frame = {}
 
     t0 = time.time()
     for ff in range(n_frames):
         frame = movie.get_frame(ff)
         result = realSEUDOfit(frame, state)
-        activity_by_frame.append(result.activity)
+        if result is None:
+            continue
+        activity_by_frame[result.frame_index] = result.activity
 
         if result.new_cells:
-            print(f'  frame {ff}: discovered cell(s) {result.new_cells} '
+            print(f'  frame {result.frame_index}: discovered cell(s) {result.new_cells} '
                   f'(total so far: {state.profiles.shape[2]})')
 
         if (ff + 1) % PROGRESS_EVERY == 0:
@@ -71,9 +78,9 @@ def run_discovery(movie, n_frames):
 
     n_cells = state.profiles.shape[2]
     discovered_tc = np.full((n_frames, n_cells), np.nan)
-    for ff, activity in enumerate(activity_by_frame):
+    for frame_idx, activity in activity_by_frame.items():
         for cell_id, value in activity.items():
-            discovered_tc[ff, cell_id] = value
+            discovered_tc[frame_idx, cell_id] = value
 
     return state, discovered_tc
 

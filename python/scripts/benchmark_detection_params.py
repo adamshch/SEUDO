@@ -29,8 +29,11 @@ DEMO_PATH = '../code/demoData1.mat'
 N_FRAMES = 3000
 MATCH_MAX_DIST = 10.0
 
+# ds_time no longer set here -- FitParams.lookahead_frames defaults to 3 and
+# takes over temporal smoothing entirely whenever it's > 1, making an
+# explicit ds_time=3 alongside it a no-op (see lookahead_frames' docstring).
 BASE_FIT = dict(sigma2=0.0020, lambda_blob=10.0, blob_radius=3.0, pad_space=5,
-                 n_jobs=8, native_nthreads=4, blob_spacing=3.0, ds_time=3)
+                 n_jobs=8, native_nthreads=4, blob_spacing=3.0)
 
 SWEEPS = [
     ('cutoff_multiplier', 'detection', [2.5, 3.0, 4.0, 5.0]),
