@@ -11,7 +11,7 @@ import pytest
 from seudo._native import NATIVE_AVAILABLE
 from seudo.estimate import estimate_time_courses_with_seudo
 from seudo.geometry import compute_roi_coms
-from seudo.streaming import DetectionParams, FitParams, StreamingState, TilingConfig, realSEUDOfit
+from seudo.streaming import CandidateTrack, DetectionParams, FitParams, StreamingState, TilingConfig, realSEUDOfit
 
 requires_native = pytest.mark.skipif(not NATIVE_AVAILABLE, reason='native extension not built')
 
@@ -150,6 +150,140 @@ def test_promoted_profile_recovers_true_shape():
     true_coms, _ = compute_roi_coms(prof1)
     built_coms, _ = compute_roi_coms(state.profiles[:, :, 1])
     np.testing.assert_allclose(built_coms[0], true_coms[0], atol=1.0)
+
+
+def _make_track_with_a_low_amplitude_fringe():
+    # a consistent 5x5 core (present, at full amplitude, in every
+    # confirmation frame) plus one extra pixel that only cleared the raw
+    # per-frame detection threshold in ONE of the three frames, at a small
+    # fraction of the core's amplitude -- exactly the "noise wobble near
+    # the threshold boundary" scenario DetectionParams.candidate_profile_
+    # threshold targets, isolated from any real detection/noise-estimation
+    # machinery for a precise, deterministic check
+    core_bbox = (10, 14, 10, 14)
+    core_crop = np.full((5, 5), 10.0)
+    core_mask = np.ones((5, 5), dtype=bool)
+
+    fringe_bbox = (10, 14, 10, 15)
+    fringe_crop = np.zeros((5, 6))
+    fringe_crop[:, :5] = 10.0
+    fringe_crop[2, 5] = 0.5
+    fringe_mask = np.zeros((5, 6), dtype=bool)
+    fringe_mask[:, :5] = True
+    fringe_mask[2, 5] = True
+
+    return CandidateTrack(centroid=(12.0, 12.0), consecutive_frames=3, gap=0, history=[
+        (0, core_bbox, core_mask, core_crop),
+        (1, fringe_bbox, fringe_mask, fringe_crop),
+        (2, core_bbox, core_mask, core_crop),
+    ])
+
+
+def test_candidate_profile_threshold_default_is_a_noop():
+    from seudo.streaming import _build_promoted_profile
+
+    track = _make_track_with_a_low_amplitude_fringe()
+    profile, _bbox = _build_promoted_profile(track, (30, 30))  # rel_threshold defaults to 0.0
+    assert profile[12, 15] == pytest.approx(0.05)
+    assert profile[12, 12] == pytest.approx(1.0)
+
+
+def test_candidate_profile_threshold_removes_a_low_amplitude_fringe():
+    from seudo.streaming import _build_promoted_profile
+
+    track = _make_track_with_a_low_amplitude_fringe()
+    profile, _bbox = _build_promoted_profile(track, (30, 30), rel_threshold=0.1)
+    assert profile[12, 15] == 0.0, 'the fringe pixel (5% of peak) should be zeroed at a 10% threshold'
+    assert profile[12, 12] == pytest.approx(1.0), 'the real core should be completely unaffected'
+
+
+def test_candidate_profile_threshold_wired_through_streaming_state():
+    # confirms DetectionParams.candidate_profile_threshold actually reaches
+    # _build_promoted_profile at promotion time, not just that the
+    # function itself honors the parameter in isolation
+    from seudo.streaming import _promote_candidate
+
+    y, x = 30, 30
+    state = StreamingState((y, x), fit=default_streaming_fit(),
+                            detection=DetectionParams(candidate_profile_threshold=0.1))
+    track = _make_track_with_a_low_amplitude_fringe()
+
+    cell_id, is_new = _promote_candidate(state, track, frame_index=0)
+    assert is_new is True
+    profile = state.profiles[:, :, cell_id]
+    assert profile[12, 15] == 0.0
+    assert profile[12, 12] == pytest.approx(1.0)
+
+
+def test_candidate_profile_threshold_still_excludes_the_full_untresholded_footprint():
+    # the STORED profile is deliberately thresholded (previous test), but
+    # the known_cell_exclude_mask must still claim the cell's FULL original
+    # extent, including the thresholded-away fringe pixel -- otherwise
+    # future frames would re-detect that fringe as a spurious new
+    # candidate. A real, benchmark-confirmed distinction, not a
+    # theoretical one: applying the threshold to the exclude mask too
+    # measurably hurt precision on real data.
+    from seudo.streaming import _promote_candidate
+
+    y, x = 30, 30
+    state = StreamingState((y, x), fit=default_streaming_fit(),
+                            detection=DetectionParams(candidate_profile_threshold=0.1, exclude_radius_known_cells=0))
+    track = _make_track_with_a_low_amplitude_fringe()
+
+    cell_id, is_new = _promote_candidate(state, track, frame_index=0)
+    assert is_new is True
+    assert state.profiles[12, 15, cell_id] == 0.0, 'sanity check: the fringe pixel is thresholded away in storage'
+    assert state.known_cell_exclude_mask[12, 15], (
+        'the exclude mask should still claim the fringe pixel even though it was thresholded out of the stored profile')
+
+
+def test_xtemp_smooth_sigma_default_is_a_noop():
+    from seudo.streaming import _build_promoted_profile
+
+    track = _make_track_with_a_low_amplitude_fringe()
+    profile, _bbox = _build_promoted_profile(track, (30, 30))  # smooth_sigma defaults to None
+    assert profile[12, 12] == pytest.approx(1.0)
+    assert profile[12, 16] == 0.0, 'no blur should mean no bleed past the fringe pixel'
+
+
+def test_xtemp_smooth_sigma_softens_a_hard_edge():
+    from seudo.streaming import _build_promoted_profile
+
+    # a plain 5x5 solid block, no fringe -- isolates the smoothing effect
+    # itself from candidate_profile_threshold's separate fringe-removal logic
+    bbox = (10, 14, 10, 14)
+    crop = np.full((5, 5), 10.0)
+    mask = np.ones((5, 5), dtype=bool)
+    track = CandidateTrack(centroid=(12.0, 12.0), consecutive_frames=1, gap=0,
+                            history=[(0, bbox, mask, crop)])
+
+    unsmoothed, _bbox = _build_promoted_profile(track, (30, 30))
+    smoothed, _bbox = _build_promoted_profile(track, (30, 30), smooth_sigma=1.0)
+
+    assert unsmoothed[9, 12] == 0.0, 'sanity check: no blur means a hard edge just outside the block (row 9, block starts at row 10)'
+    assert smoothed[9, 12] > 0.0, 'a small Gaussian blur should bleed slightly past the original hard edge'
+    assert smoothed[12, 12] == pytest.approx(1.0), 'still peak-normalized to 1.0 after smoothing'
+
+
+def test_xtemp_smooth_sigma_wired_through_streaming_state():
+    # confirms DetectionParams.xtemp_smooth_sigma actually reaches
+    # _build_promoted_profile at promotion time, not just that the
+    # function itself honors the parameter in isolation
+    from seudo.streaming import _promote_candidate
+
+    bbox = (10, 14, 10, 14)
+    crop = np.full((5, 5), 10.0)
+    mask = np.ones((5, 5), dtype=bool)
+    track = CandidateTrack(centroid=(12.0, 12.0), consecutive_frames=3, gap=0,
+                            history=[(0, bbox, mask, crop)])
+
+    y, x = 30, 30
+    state = StreamingState((y, x), fit=default_streaming_fit(),
+                            detection=DetectionParams(xtemp_smooth_sigma=1.0))
+    cell_id, is_new = _promote_candidate(state, track, frame_index=0)
+    assert is_new is True
+    assert state.profiles[9, 12, cell_id] > 0.0, (
+        'the stored profile should show smoothing bleed just outside the original hard edge')
 
 
 def test_tiling_boundary_no_double_detect_or_miss():
@@ -510,7 +644,7 @@ def test_subtract_tracked_contributions_removes_tracked_signal():
 
     rng = np.random.default_rng(0)
     residual = prof * 3.0 + 0.01 * rng.normal(size=(y, x))
-    residual2, exclude_mask, track_footprints = _subtract_tracked_contributions(state, residual)
+    residual2, exclude_mask, track_footprints, _track_weights = _subtract_tracked_contributions(state, residual)
 
     footprint = prof > 0
     assert np.abs(residual2[footprint]).sum() < 0.5 * np.abs(residual[footprint]).sum(), (
@@ -550,12 +684,120 @@ def test_subtract_tracked_contributions_fits_overlapping_tracks_jointly():
     true_weight_a, true_weight_b = 3.0, 5.0
     residual = prof_a * true_weight_a + prof_b * true_weight_b  # clean, no noise
 
-    residual2, _exclude_mask, _track_footprints = _subtract_tracked_contributions(state, residual)
+    residual2, _exclude_mask, _track_footprints, _track_weights = _subtract_tracked_contributions(state, residual)
 
     combined_footprint = (prof_a > 0) | (prof_b > 0)
     assert np.abs(residual2[combined_footprint]).max() < 0.1 * max(true_weight_a, true_weight_b), (
         'jointly fitting overlapping tracks should decompose both signals correctly, '
         'not leave real residual from misattributing the overlap region')
+
+
+def _make_track_for_revert_test():
+    bbox = (10, 20, 10, 20)
+    mask = np.ones((11, 11), dtype=bool)
+    crop = np.ones((11, 11))
+    return CandidateTrack(centroid=(15.0, 15.0), consecutive_frames=2, gap=0,
+                           history=[(0, bbox, mask, crop), (1, bbox, mask, crop)])
+
+
+def test_revert_low_signal_matches_is_a_noop_when_ratio_is_zero():
+    # PromotionParams.min_track_fit_ratio defaults to 0.0 (off) -- even a
+    # track whose per-frame fit weight is essentially zero should be left
+    # completely untouched
+    from seudo.streaming import _revert_low_signal_matches
+
+    y, x = 30, 30
+    state = StreamingState((y, x), fit=default_streaming_fit())  # min_track_fit_ratio=0.0 by default
+    state.candidate_tracks[0] = _make_track_for_revert_test()
+    noise_map = np.full((y, x), 1.0)
+
+    _revert_low_signal_matches(state, {0}, {0: 0.0}, noise_map)
+
+    track = state.candidate_tracks[0]
+    assert track.consecutive_frames == 2
+    assert len(track.history) == 2
+    assert track.gap == 0
+
+
+def test_revert_low_signal_matches_reverts_a_weak_fit_and_tolerates_it_as_a_gap():
+    from seudo.streaming import PromotionParams, _revert_low_signal_matches
+
+    y, x = 30, 30
+    promotion = PromotionParams(min_track_fit_ratio=0.5, max_track_gap=1)
+    state = StreamingState((y, x), fit=default_streaming_fit(), promotion=promotion)
+    state.candidate_tracks[0] = _make_track_for_revert_test()
+    noise_map = np.full((y, x), 1.0)  # threshold = 0.5 * 1.0 = 0.5
+
+    _revert_low_signal_matches(state, {0}, {0: 0.01}, noise_map)  # 0.01 <= 0.5 -> revert
+
+    assert 0 in state.candidate_tracks, 'a single reverted frame should be tolerated as an ordinary gap'
+    track = state.candidate_tracks[0]
+    assert track.consecutive_frames == 1, 'this frame\'s progress should be rolled back'
+    assert len(track.history) == 1, 'this frame\'s history entry should be dropped'
+    assert track.gap == 1
+
+
+def test_revert_low_signal_matches_drops_the_track_once_gap_tolerance_is_exceeded():
+    from seudo.streaming import PromotionParams, _revert_low_signal_matches
+
+    y, x = 30, 30
+    promotion = PromotionParams(min_track_fit_ratio=0.5, max_track_gap=1)
+    state = StreamingState((y, x), fit=default_streaming_fit(), promotion=promotion)
+    track = _make_track_for_revert_test()
+    track.gap = 1  # already tolerated one ordinary gap earlier
+    state.candidate_tracks[0] = track
+    noise_map = np.full((y, x), 1.0)
+
+    _revert_low_signal_matches(state, {0}, {0: 0.01}, noise_map)
+
+    assert 0 not in state.candidate_tracks, 'a second consecutive weak frame should exceed max_track_gap and drop the track'
+
+
+def test_revert_low_signal_matches_leaves_a_strong_fit_alone():
+    from seudo.streaming import PromotionParams, _revert_low_signal_matches
+
+    y, x = 30, 30
+    promotion = PromotionParams(min_track_fit_ratio=0.5, max_track_gap=1)
+    state = StreamingState((y, x), fit=default_streaming_fit(), promotion=promotion)
+    state.candidate_tracks[0] = _make_track_for_revert_test()
+    noise_map = np.full((y, x), 1.0)
+
+    _revert_low_signal_matches(state, {0}, {0: 5.0}, noise_map)  # 5.0 > 0.5 -> no revert
+
+    track = state.candidate_tracks[0]
+    assert track.consecutive_frames == 2
+    assert len(track.history) == 2
+    assert track.gap == 0
+
+
+def test_min_track_fit_ratio_default_realseudofit_run_is_a_noop():
+    # end-to-end regression: with min_track_fit_ratio left at its default
+    # (0.0), a real multi-cell run should be bit-identical to before this
+    # feature existed
+    y, x, f = 30, 60, 60
+    prof0 = gaussian_patch((y, x), center=(15, 15), sigma=2.0)
+    prof0[prof0 < 0.05 * prof0.max()] = 0.0
+    prof1 = gaussian_patch((y, x), center=(15, 45), sigma=2.0)
+    prof1[prof1 < 0.05 * prof1.max()] = 0.0
+
+    rng = np.random.default_rng(4)
+    movie = np.zeros((y, x, f))
+    for ff in range(f):
+        act1 = 3.0 if ff >= 20 else 0.0
+        movie[:, :, ff] = prof0 * 2.0 + prof1 * act1 + 0.01 * rng.normal(size=(y, x))
+
+    def run(promotion):
+        state = StreamingState((y, x), initial_profiles=prof0[:, :, np.newaxis],
+                                fit=default_streaming_fit(), promotion=promotion)
+        n_cells, promoted_at = None, None
+        for ff in range(f):
+            result = realSEUDOfit(movie[:, :, ff], state)
+            if result.new_cells and promoted_at is None:
+                promoted_at = ff
+        return state.profiles.shape[2], promoted_at
+
+    from seudo.streaming import PromotionParams
+    assert run(PromotionParams()) == run(PromotionParams(min_track_fit_ratio=0.0))
 
 
 def test_tracked_candidate_never_spawns_a_duplicate_track():
@@ -751,6 +993,148 @@ def test_start_candidate_tracks_still_creates_a_track_for_a_disjoint_candidate()
     assert len(state.candidate_tracks) == 1
 
 
+def test_confirm_candidate_via_blob_fit_rejects_a_weak_subthreshold_bump():
+    # the raw threshold+connected-components detector has no sparsity or
+    # nonnegativity regularization of its own -- a single weak pixel just
+    # above SOME threshold can still pass it. The real, lambda_blob/sigma2-
+    # regularized blob fit should reject it once it's too weak to survive
+    # the L1 penalty (effective blob lambda here is 2*sigma2_ds*lambda_blob
+    # = 2*0.002*10 = 0.04, since lookahead_frames=1 leaves sigma2_ds=sigma2)
+    from seudo.streaming import RawCandidate, _confirm_candidate_via_blob_fit
+
+    y, x = 40, 40
+    state = StreamingState((y, x), fit=default_streaming_fit())
+    weak = np.zeros((y, x))
+    weak[20, 20] = 0.05
+    cand = RawCandidate(centroid=(20.0, 20.0), bbox=(20, 20, 20, 20), mask=np.ones((1, 1), dtype=bool))
+    assert _confirm_candidate_via_blob_fit(state, cand, weak) is False
+
+
+def test_confirm_candidate_via_blob_fit_confirms_real_signal():
+    from seudo.streaming import RawCandidate, _confirm_candidate_via_blob_fit
+
+    y, x = 40, 40
+    state = StreamingState((y, x), fit=default_streaming_fit())
+    strong = np.zeros((y, x))
+    strong[20, 20] = 0.5
+    cand = RawCandidate(centroid=(20.0, 20.0), bbox=(20, 20, 20, 20), mask=np.ones((1, 1), dtype=bool))
+    assert _confirm_candidate_via_blob_fit(state, cand, strong) is True
+
+
+def test_confirm_new_candidates_default_is_a_noop():
+    # DetectionParams.confirm_new_candidates defaults to False -- a weak,
+    # noise-scale candidate that the (unregularized) raw threshold detector
+    # already flagged should still start a track exactly as before this
+    # feature existed
+    from seudo.streaming import RawCandidate, _start_candidate_tracks
+
+    y, x = 40, 40
+    state = StreamingState((y, x), fit=default_streaming_fit())  # confirm_new_candidates=False by default
+    weak = np.zeros((y, x))
+    weak[20, 20] = 0.05
+    cand = RawCandidate(centroid=(20.0, 20.0), bbox=(20, 20, 20, 20), mask=np.ones((1, 1), dtype=bool))
+
+    _start_candidate_tracks(state, [cand], weak, 0, [])
+    assert len(state.candidate_tracks) == 1
+
+
+def test_confirm_new_candidates_rejects_a_weak_raw_candidate():
+    from seudo.streaming import DetectionParams, RawCandidate, _start_candidate_tracks
+
+    y, x = 40, 40
+    state = StreamingState((y, x), fit=default_streaming_fit(),
+                            detection=DetectionParams(confirm_new_candidates=True))
+    weak = np.zeros((y, x))
+    weak[20, 20] = 0.05
+    cand = RawCandidate(centroid=(20.0, 20.0), bbox=(20, 20, 20, 20), mask=np.ones((1, 1), dtype=bool))
+
+    _start_candidate_tracks(state, [cand], weak, 0, [])
+    assert len(state.candidate_tracks) == 0, 'a candidate too weak to survive the regularized fit should be rejected'
+
+
+def test_confirm_new_candidates_still_accepts_a_real_candidate():
+    from seudo.streaming import DetectionParams, RawCandidate, _start_candidate_tracks
+
+    y, x = 40, 40
+    state = StreamingState((y, x), fit=default_streaming_fit(),
+                            detection=DetectionParams(confirm_new_candidates=True))
+    strong = np.zeros((y, x))
+    strong[20, 20] = 0.5
+    cand = RawCandidate(centroid=(20.0, 20.0), bbox=(20, 20, 20, 20), mask=np.ones((1, 1), dtype=bool))
+
+    _start_candidate_tracks(state, [cand], strong, 0, [])
+    assert len(state.candidate_tracks) == 1, 'a genuinely strong candidate should still be accepted'
+
+
+def test_eq8_merge_threshold_default_matches_original_behavior():
+    # sanity check the new PromotionParams.eq8_merge_threshold default
+    # (0.75) reproduces the original hardcoded k_temp exactly -- this is
+    # the same borderline (one-corner-pixel overlap) case
+    # test_should_merge_temp_profiles_eq8 already confirms does NOT merge
+    # at k_temp=0.75
+    from seudo.streaming import _should_merge_temp_profiles
+
+    mask_c = np.ones((3, 3), dtype=bool)
+    bbox_c = (0, 2, 0, 2)
+    mask_d = np.ones((3, 3), dtype=bool)
+    bbox_d = (2, 4, 2, 4)
+    assert _should_merge_temp_profiles(mask_c, bbox_c, mask_d, bbox_d, k_temp=0.75) is False
+
+
+def test_eq8_merge_threshold_lower_value_merges_a_borderline_case():
+    # the same borderline one-corner-pixel-overlap case, but with a much
+    # lower (more aggressive) threshold -- should now merge
+    from seudo.streaming import _should_merge_temp_profiles
+
+    mask_c = np.ones((3, 3), dtype=bool)
+    bbox_c = (0, 2, 0, 2)
+    mask_d = np.ones((3, 3), dtype=bool)
+    bbox_d = (2, 4, 2, 4)
+    assert _should_merge_temp_profiles(mask_c, bbox_c, mask_d, bbox_d, k_temp=0.1) is True
+
+
+def test_eq8_merge_threshold_wired_through_start_candidate_tracks():
+    from seudo.streaming import PromotionParams, RawCandidate, _start_candidate_tracks
+
+    y, x = 30, 30
+    state = StreamingState((y, x), fit=default_streaming_fit(),
+                            promotion=PromotionParams(eq8_merge_threshold=0.1))
+    existing_mask = np.ones((3, 3), dtype=bool)
+    existing_bbox = (0, 2, 0, 2)
+    track_footprints = [(0, existing_mask, existing_bbox)]
+
+    borderline_cand = RawCandidate(centroid=(3.0, 3.0), bbox=(2, 4, 2, 4), mask=np.ones((3, 3), dtype=bool))
+    n_before = state._next_track_id
+    _start_candidate_tracks(state, [borderline_cand], np.zeros((y, x)), 0, track_footprints)
+    assert state._next_track_id == n_before, 'a lowered eq8_merge_threshold should absorb this borderline candidate'
+
+
+def test_eq9_merge_threshold_wired_through_promote_candidate():
+    # two nearby-but-genuinely-distinct cells (same scenario as
+    # test_find_stable_merge_target) are NOT merged at the default
+    # threshold -- a much lower eq9_merge_threshold should merge them
+    from seudo.streaming import CandidateTrack, PromotionParams, _promote_candidate
+
+    y, x = 30, 30
+    prof = gaussian_patch((y, x), center=(15, 15), sigma=2.0)
+    prof[prof < 0.05 * prof.max()] = 0.0
+
+    state = StreamingState((y, x), initial_profiles=prof[:, :, np.newaxis], fit=default_streaming_fit(),
+                            promotion=PromotionParams(eq9_merge_threshold=0.1))
+    n_before = state.profiles.shape[2]
+
+    distinct = gaussian_patch((y, x), center=(15, 19), sigma=2.0)
+    distinct[distinct < 0.05 * distinct.max()] = 0.0
+    bbox = (10, 20, 14, 24)
+    crop = distinct[bbox[0]:bbox[1] + 1, bbox[2]:bbox[3] + 1]
+    mask = crop > 0
+    track = CandidateTrack(centroid=(15.0, 19.0), consecutive_frames=3, gap=0, history=[(0, bbox, mask, crop)] * 3)
+
+    cell_id, is_new = _promote_candidate(state, track, frame_index=0)
+    assert is_new is False, 'a lowered eq9_merge_threshold should merge these two nearby-but-distinct profiles'
+    assert state.profiles.shape[2] == n_before
+
+
 def test_spatial_denoise_radius_default_is_a_noop():
     y, x = 20, 20
     state = StreamingState((y, x), fit=FitParams(lookahead_frames=1))
@@ -877,6 +1261,48 @@ def test_quarantine_rejected_regions_expands_bbox_by_exclude_radius():
     assert state.rejected_region_mask[10:16, 10:16].all(), 'the rejected bbox itself must be quarantined'
     assert state.rejected_region_mask[7, 10], 'quarantine should expand by exclude_radius_known_cells'
     assert not state.rejected_region_mask[6, 10], 'expansion should not go further than exclude_radius_known_cells'
+
+
+def test_negative_exclude_radius_disables_known_cell_exclusion_entirely():
+    # r=0 still unconditionally excludes the known cell's own footprint
+    # (no dilation buffer, but the footprint pixels themselves are always
+    # excluded) -- r<0 must be real "off": the mask should stay all-False
+    # even directly over a known cell's own footprint
+    from seudo.streaming import _update_known_cell_exclude_mask
+
+    y, x = 30, 30
+    profile = np.zeros((y, x, 1))
+    profile[10:16, 10:16, 0] = 1.0
+
+    state_off = StreamingState((y, x), initial_profiles=profile,
+                                fit=default_streaming_fit(),
+                                detection=DetectionParams(exclude_radius_known_cells=-1))
+    _update_known_cell_exclude_mask(state_off, 0, 10, 15, 10, 15)
+    assert not state_off.known_cell_exclude_mask.any(), (
+        'exclude_radius_known_cells<0 should never populate the known-cell exclude mask')
+
+    state_zero = StreamingState((y, x), initial_profiles=profile,
+                                 fit=default_streaming_fit(),
+                                 detection=DetectionParams(exclude_radius_known_cells=0))
+    _update_known_cell_exclude_mask(state_zero, 0, 10, 15, 10, 15)
+    assert state_zero.known_cell_exclude_mask[12, 12], (
+        'exclude_radius_known_cells=0 should still exclude the cell\'s own footprint (not real "off")'
+    )
+
+
+def test_negative_exclude_radius_floors_quarantine_dilation_at_zero():
+    # quarantine of an oversized rejected region is a different concern
+    # from known-cell exclusion -- r<0 must not shrink it, just skip
+    # dilation the same way r=0 already does
+    from seudo.streaming import _quarantine_rejected_regions
+
+    y, x = 30, 30
+    state_neg = StreamingState((y, x), fit=default_streaming_fit(),
+                                detection=DetectionParams(exclude_radius_known_cells=-1))
+    _quarantine_rejected_regions(state_neg, [(10, 15, 10, 15)])
+    assert state_neg.rejected_region_mask[10:16, 10:16].all(), 'the rejected bbox itself must still be quarantined'
+    assert not state_neg.rejected_region_mask[9, 10], 'negative radius must not dilate the quarantined region'
+    assert not state_neg.rejected_region_mask[16, 10], 'negative radius must not shrink the quarantined region either'
 
 
 def test_eq9_containment_ratios():
